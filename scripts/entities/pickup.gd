@@ -12,7 +12,7 @@ var _t := 0.0
 
 
 func _ready() -> void:
-	sprite.region_rect = Rect2(int(kind) * 16, 0, 16, 16)
+	sprite.region_rect = Rect2(int(kind) * 64, 0, 64, 64)
 	_base_y = position.y
 	_t = position.x * 0.1
 	body_entered.connect(_on_body_entered)

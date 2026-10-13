@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
-"""Generates all of Jungleman's placeholder pixel art.
+"""Generates all of Jungleman's art in a smooth, high-resolution style.
 
-Everything here is drawn procedurally (no external assets), so the art is
-original and can be regenerated or tweaked at any time:
+Everything is drawn procedurally (no external assets), so the art is original
+and can be regenerated or tweaked at any time:
 
     python3 tools/generate_art.py
 
-Outputs PNG sprite sheets under assets/ and matching Godot SpriteFrames
-(.tres) resources so the animations show up in the editor's SpriteFrames panel.
-Requires Pillow (pip install pillow).
+Shapes are drawn with soft gradients, rim light and outlines, supersampled for
+clean anti-aliased edges, then saved at 4 texture pixels per world pixel
+(`S` below). In-game sprites are scaled by 1/S, so gameplay sizes stay the same
+while the art stays sharp at 1080p.
+
+Requires Pillow and NumPy (pip install pillow numpy).
 """
 import math
 import os
+import random
 
-from PIL import Image, ImageDraw
+import numpy as np
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPRITES = os.path.join(ROOT, "assets", "sprites")
 TILES = os.path.join(ROOT, "assets", "tiles")
 BG = os.path.join(ROOT, "assets", "backgrounds")
+FX = os.path.join(ROOT, "assets", "fx")
+
+S = 4  # texture pixels per world pixel
+AA = 3  # supersampling factor while drawing
 
 
 def hexc(s, a=255):
@@ -26,55 +35,159 @@ def hexc(s, a=255):
     return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), a)
 
 
-OUTLINE = hexc("1a1008")
+def mix(c0, c1, t):
+    return tuple(int(round(c0[i] + (c1[i] - c0[i]) * t)) for i in range(4))
 
 
-def new(w, h):
-    return Image.new("RGBA", (w, h), (0, 0, 0, 0))
+def shade(c, f):
+    """f > 0 lightens toward white, f < 0 darkens toward black."""
+    if f >= 0:
+        return mix(c, (255, 255, 255, c[3]), f)
+    return mix(c, (0, 0, 0, c[3]), -f)
 
 
-def plot(img, x, y, c):
-    x = int(math.floor(x + 0.5))
-    y = int(math.floor(y + 0.5))
-    if 0 <= x < img.width and 0 <= y < img.height:
-        img.putpixel((x, y), c)
+class Lin:
+    """Linear gradient between two world-space points."""
+
+    def __init__(self, c0, c1, p0, p1):
+        self.c0, self.c1, self.p0, self.p1 = c0, c1, p0, p1
 
 
-def line(img, p0, p1, w, c):
-    """Thick pixel line made of stamped squares."""
-    x0, y0 = p0
-    x1, y1 = p1
-    n = int(max(abs(x1 - x0), abs(y1 - y0)) * 2) + 1
-    for i in range(n + 1):
-        t = i / n
-        x = x0 + (x1 - x0) * t
-        y = y0 + (y1 - y0) * t
-        for dx in range(w):
-            for dy in range(w):
-                plot(img, x - (w - 1) / 2 + dx, y - (w - 1) / 2 + dy, c)
+class Rad:
+    """Radial gradient from a world-space centre."""
+
+    def __init__(self, c0, c1, center, radius):
+        self.c0, self.c1, self.center, self.radius = c0, c1, center, radius
 
 
-def rect(img, x0, y0, x1, y1, c):
-    for x in range(x0, x1 + 1):
-        for y in range(y0, y1 + 1):
-            plot(img, x, y, c)
+class Canvas:
+    """RGBA drawing surface addressed in world units, supersampled."""
 
+    def __init__(self, w, h, aa=AA, scale=S):
+        self.w, self.h = w, h
+        self.scale = scale
+        self.k = scale * aa
+        self.size = (int(round(w * self.k)), int(round(h * self.k)))
+        self.img = Image.new("RGBA", self.size, (0, 0, 0, 0))
 
-def outline(img, c=OUTLINE):
-    """Adds a 1px outline around every opaque pixel."""
-    src = img.copy()
-    px = src.load()
-    w, h = src.size
-    for x in range(w):
-        for y in range(h):
-            if px[x, y][3] != 0:
-                continue
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < w and 0 <= ny < h and px[nx, ny][3] != 0:
-                    img.putpixel((x, y), c)
-                    break
-    return img
+    # -- masks -----------------------------------------------------------
+    def _m(self):
+        return Image.new("L", self.size, 0)
+
+    def _p(self, pts):
+        return [(x * self.k, y * self.k) for x, y in pts]
+
+    def m_ellipse(self, cx, cy, rx, ry):
+        m = self._m()
+        k = self.k
+        ImageDraw.Draw(m).ellipse(((cx - rx) * k, (cy - ry) * k, (cx + rx) * k, (cy + ry) * k), fill=255)
+        return m
+
+    def m_poly(self, pts):
+        m = self._m()
+        ImageDraw.Draw(m).polygon(self._p(pts), fill=255)
+        return m
+
+    def m_rrect(self, x0, y0, x1, y1, r):
+        m = self._m()
+        k = self.k
+        ImageDraw.Draw(m).rounded_rectangle((x0 * k, y0 * k, x1 * k, y1 * k), radius=r * k, fill=255)
+        return m
+
+    def m_stroke(self, pts, r, r_end=None):
+        """Round-capped stroke through points; radius can taper to r_end."""
+        m = self._m()
+        d = ImageDraw.Draw(m)
+        k = self.k
+        n = len(pts)
+        r_end = r if r_end is None else r_end
+        for i in range(n - 1):
+            (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+            ra = r + (r_end - r) * i / max(n - 1, 1)
+            rb = r + (r_end - r) * (i + 1) / max(n - 1, 1)
+            dx, dy = x1 - x0, y1 - y0
+            ln = math.hypot(dx, dy) or 1e-6
+            nx, ny = -dy / ln, dx / ln
+            quad = [(x0 + nx * ra, y0 + ny * ra), (x1 + nx * rb, y1 + ny * rb), (x1 - nx * rb, y1 - ny * rb), (x0 - nx * ra, y0 - ny * ra)]
+            d.polygon(self._p(quad), fill=255)
+        for i, (x, y) in enumerate(pts):
+            rr = (r + (r_end - r) * i / max(n - 1, 1)) * k
+            d.ellipse((x * k - rr, y * k - rr, x * k + rr, y * k + rr), fill=255)
+        return m
+
+    # -- painting --------------------------------------------------------
+    def _paint_img(self, paint, bbox):
+        w, h = self.size
+        if isinstance(paint, tuple):
+            return Image.new("RGBA", self.size, paint)
+        x0, y0, x1, y1 = bbox
+        xs = (np.arange(x0, x1) + 0.5) / self.k
+        ys = (np.arange(y0, y1) + 0.5) / self.k
+        X, Y = np.meshgrid(xs, ys)
+        if isinstance(paint, Lin):
+            (ax, ay), (bx, by) = paint.p0, paint.p1
+            dx, dy = bx - ax, by - ay
+            t = ((X - ax) * dx + (Y - ay) * dy) / max(dx * dx + dy * dy, 1e-6)
+        else:
+            cx, cy = paint.center
+            t = np.hypot(X - cx, Y - cy) / max(paint.radius, 1e-6)
+        t = np.clip(t, 0.0, 1.0)[..., None]
+        c0 = np.array(paint.c0, dtype=np.float32)
+        c1 = np.array(paint.c1, dtype=np.float32)
+        arr = np.zeros((h, w, 4), dtype=np.uint8)
+        arr[y0:y1, x0:x1] = (c0 + (c1 - c0) * t).astype(np.uint8)
+        return Image.fromarray(arr, "RGBA")
+
+    def fill(self, mask, paint, alpha=1.0):
+        bbox = mask.getbbox()
+        if not bbox:
+            return
+        src = self._paint_img(paint, bbox)
+        a = ImageChops.multiply(src.getchannel("A"), mask)
+        if alpha < 1.0:
+            a = a.point(lambda v: int(v * alpha))
+        src.putalpha(a)
+        self.img.alpha_composite(src)
+
+    def ellipse(self, cx, cy, rx, ry, paint, alpha=1.0):
+        self.fill(self.m_ellipse(cx, cy, rx, ry), paint, alpha)
+
+    def poly(self, pts, paint, alpha=1.0):
+        self.fill(self.m_poly(pts), paint, alpha)
+
+    def rrect(self, x0, y0, x1, y1, r, paint, alpha=1.0):
+        self.fill(self.m_rrect(x0, y0, x1, y1, r), paint, alpha)
+
+    def stroke(self, pts, r, paint, r_end=None, alpha=1.0):
+        self.fill(self.m_stroke(pts, r, r_end), paint, alpha)
+
+    def blur_layer(self, draw_fn, radius):
+        """Draw onto a temporary canvas, blur it and composite (glows, shadows)."""
+        tmp = Canvas(self.w, self.h, aa=self.k // self.scale, scale=self.scale)
+        draw_fn(tmp)
+        blurred = tmp.img.convert("RGBa").filter(ImageFilter.GaussianBlur(radius * self.k)).convert("RGBA")
+        self.img.alpha_composite(blurred)
+
+    def outline(self, color, width):
+        """Adds an outline behind everything drawn so far."""
+        r = max(1, int(round(width * self.k)))
+        a = self.img.getchannel("A").point(lambda v: 255 if v > 40 else 0)
+        grown = a.filter(ImageFilter.MaxFilter(2 * r + 1)).filter(ImageFilter.GaussianBlur(self.k * 0.25))
+        under = Image.new("RGBA", self.size, color)
+        under.putalpha(grown)
+        under.alpha_composite(self.img)
+        self.img = under
+
+    def paste(self, other):
+        self.img.alpha_composite(other.img)
+
+    def final(self):
+        img = self.img
+        if getattr(self, "under", None) is not None:
+            img = self.under.img.copy()
+            img.alpha_composite(self.img)
+        out = img.convert("RGBa").resize((int(round(self.w * self.scale)), int(round(self.h * self.scale))), Image.LANCZOS)
+        return out.convert("RGBA")
 
 
 def rad(d):
@@ -86,115 +199,153 @@ def limb_end(start, ang, length):
     return (start[0] + math.sin(rad(ang)) * length, start[1] + math.cos(rad(ang)) * length)
 
 
+def catmull(points, steps=8):
+    out = []
+    pts = [points[0]] + list(points) + [points[-1]]
+    for i in range(1, len(pts) - 2):
+        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
+        for s in range(steps):
+            t = s / steps
+            t2, t3 = t * t, t * t * t
+            out.append(tuple(0.5 * ((2 * p1[j]) + (-p0[j] + p2[j]) * t + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * t2 + (-p0[j] + 3 * p1[j] - 3 * p2[j] + p3[j]) * t3) for j in range(2)))
+    out.append(points[-1])
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Player: a pith-helmeted jungle explorer drawn from a simple skeleton.
+# Player: a jungle explorer in a pith helmet, built from a posable skeleton.
 # ---------------------------------------------------------------------------
+INK = hexc("2a1a10")
 PAL = {
-    "skin": hexc("e0a070"),
-    "skin_dark": hexc("b07850"),
-    "hair": hexc("4a2a14"),
-    "hat": hexc("d8b878"),
-    "hat_band": hexc("7a4a24"),
-    "shirt": hexc("c8a860"),
-    "shirt_dark": hexc("98783c"),
-    "pants": hexc("5a6a3a"),
-    "pants_dark": hexc("3e4a28"),
-    "boot": hexc("4a2c14"),
-    "belt": hexc("3a2410"),
-    "eye": hexc("1a1008"),
-    "whip": hexc("6a3c1c"),
+    "skin": hexc("f2b68a"),
+    "skin_d": hexc("c9825a"),
+    "hair": hexc("5a3218"),
+    "hat": hexc("efd9a2"),
+    "hat_d": hexc("b8975a"),
+    "band": hexc("7a4a24"),
+    "shirt": hexc("e4c47c"),
+    "shirt_d": hexc("a8823e"),
+    "pants": hexc("6f7f45"),
+    "pants_d": hexc("44522a"),
+    "boot": hexc("6a3f1f"),
+    "boot_d": hexc("3a2210"),
+    "strap": hexc("7a4a24"),
+    "whip": hexc("7a4422"),
 }
+LIGHT = (-0.55, -1.0)  # light comes from the upper left
+
+
+def lit(c_light, c_dark, center, size):
+    lx, ly = LIGHT
+    ln = math.hypot(lx, ly)
+    lx, ly = lx / ln, ly / ln
+    p0 = (center[0] + lx * size, center[1] + ly * size)
+    p1 = (center[0] - lx * size, center[1] - ly * size)
+    return Lin(c_light, c_dark, p0, p1)
 
 
 def draw_player(p):
-    img = new(32, 32)
+    c = Canvas(32, 32)
     dy = p.get("dy", 0)
     hip = (16 + p.get("dx", 0), 20 + dy)
     lean = p.get("lean", 0)
-    neck = limb_end(hip, 180 + lean, 8)
-    shoulder = limb_end(neck, 180 + lean, -1)
+    neck = limb_end(hip, 180 + lean, 7.5)
+    shoulder = limb_end(neck, 180 + lean, -0.8)
 
-    def leg(th, bend, pants, back):
-        knee = limb_end(hip, th, 5)
-        foot = limb_end(knee, th - bend, 6)
-        line(img, hip, knee, 3, pants)
-        line(img, knee, foot, 3, pants)
-        fx, fy = int(math.floor(foot[0] + 0.5)), int(math.floor(foot[1] + 0.5))
-        rect(img, fx - 1, fy - 1, fx + 2, fy, PAL["boot"] if not back else hexc("33200e"))
+    def leg(cv, th, bend, back):
+        knee = limb_end(hip, th, 5.2)
+        foot = limb_end(knee, th - bend, 5.4)
+        pants = PAL["pants_d"] if back else PAL["pants"]
+        dark = shade(pants, -0.35)
+        cv.stroke([hip, knee], 1.75, lit(shade(pants, 0.15), dark, knee, 3))
+        cv.stroke([knee, foot], 1.55, lit(shade(pants, 0.1), dark, foot, 3))
+        bc = PAL["boot_d"] if back else PAL["boot"]
+        cv.rrect(foot[0] - 1.6, foot[1] - 1.6, foot[0] + 2.6, foot[1] + 0.6, 1.0, lit(shade(bc, 0.25), shade(bc, -0.3), foot, 2))
 
-    def arm(sh, el, skin, sleeve, layer=None):
-        dst = layer if layer is not None else img
-        elbow = limb_end(shoulder, sh, 3)
-        hand = limb_end(elbow, sh + el, 5)
-        line(dst, shoulder, elbow, 2, sleeve)
-        line(dst, elbow, hand, 2, skin)
-        plot(dst, hand[0], hand[1], skin)
+    def arm(cv, sh, el, back):
+        elbow = limb_end(shoulder, sh, 3.2)
+        hand = limb_end(elbow, sh + el, 4.4)
+        sleeve = PAL["shirt_d"] if back else PAL["shirt"]
+        skin = PAL["skin_d"] if back else PAL["skin"]
+        cv.stroke([elbow, hand], 1.05, lit(shade(skin, 0.1), shade(skin, -0.25), hand, 3))
+        cv.ellipse(hand[0], hand[1], 1.2, 1.2, lit(shade(skin, 0.15), shade(skin, -0.25), hand, 1.5))
+        cv.stroke([shoulder, elbow], 1.35, lit(shade(sleeve, 0.15), shade(sleeve, -0.3), elbow, 3))
         return hand
 
-    # back limbs first (darker), then torso, front leg, head, front arm
-    back_hand = arm(p.get("bsh", -10), p.get("bel", 20), PAL["skin_dark"], PAL["shirt_dark"])
-    leg(p.get("bth", -5), p.get("bkn", 5), PAL["pants_dark"], True)
-    line(img, hip, neck, 5, PAL["shirt"])
-    # belt
-    line(img, limb_end(hip, 90 + lean, -2), limb_end(hip, 90 + lean, 2), 1, PAL["belt"])
-    leg(p.get("fth", 5), p.get("fkn", 5), PAL["pants"], False)
+    # back limbs
+    arm(c, p.get("bsh", -10), p.get("bel", 20), True)
+    leg(c, p.get("bth", -5), p.get("bkn", 5), True)
+    # torso
+    mid = ((hip[0] + neck[0]) / 2, (hip[1] + neck[1]) / 2)
+    c.stroke([hip, neck], 2.7, lit(shade(PAL["shirt"], 0.2), PAL["shirt_d"], mid, 5))
+    # satchel strap and belt
+    c.stroke([limb_end(neck, 90 + lean, 1.6), limb_end(hip, 90 + lean, -2.0)], 0.45, PAL["strap"])
+    c.stroke([limb_end(hip, 90 + lean, -2.6), limb_end(hip, 90 + lean, 2.6)], 0.6, hexc("4a2a14"))
+    leg(c, p.get("fth", 5), p.get("fkn", 5), False)
 
-    head = limb_end(neck, 180 + lean, 4)
-    hx, hy = int(math.floor(head[0] + 0.5)), int(math.floor(head[1] + 0.5))
-    rect(img, hx - 2, hy - 2, hx + 2, hy + 2, PAL["skin"])
-    rect(img, hx - 2, hy - 2, hx - 1, hy + 1, PAL["hair"])
-    plot(img, hx + 1, hy - 1, PAL["eye"])
-    plot(img, hx + 2, hy + 1, PAL["skin_dark"])
-    # pith helmet: dome + wide brim
-    rect(img, hx - 2, hy - 5, hx + 2, hy - 3, PAL["hat"])
-    rect(img, hx - 1, hy - 6, hx + 1, hy - 6, PAL["hat"])
-    rect(img, hx - 4, hy - 2, hx + 4, hy - 2, PAL["hat"])
-    rect(img, hx - 2, hy - 3, hx + 2, hy - 3, PAL["hat_band"])
+    # head
+    head = limb_end(neck, 180 + lean, 3.6)
+    hx, hy = head
+    c.ellipse(hx + 0.2, hy + 0.3, 2.9, 3.0, lit(shade(PAL["skin"], 0.15), PAL["skin_d"], head, 3))
+    c.ellipse(hx - 1.6, hy + 0.2, 1.5, 1.9, PAL["hair"])
+    c.ellipse(hx - 0.6, hy + 0.6, 0.6, 0.8, shade(PAL["skin_d"], -0.05))  # ear
+    c.ellipse(hx + 1.5, hy + 0.1, 0.45, 0.6, hexc("2a1a10"))  # eye
+    c.ellipse(hx + 1.65, hy - 0.1, 0.16, 0.16, hexc("ffffff"))
+    c.stroke([(hx + 0.9, hy - 0.9), (hx + 2.1, hy - 0.8)], 0.22, PAL["hair"])  # brow
+    c.stroke([(hx + 1.6, hy + 1.8), (hx + 2.4, hy + 1.6)], 0.18, shade(PAL["skin_d"], -0.2))  # mouth
+    c.ellipse(hx + 2.9, hy + 0.5, 0.55, 0.45, PAL["skin_d"])  # nose
+    # pith helmet
+    c.fill(c.m_ellipse(hx, hy - 2.7, 3.3, 2.7), lit(shade(PAL["hat"], 0.3), PAL["hat_d"], (hx, hy - 3.5), 3))
+    c.ellipse(hx + 0.3, hy - 1.9, 4.9, 0.85, lit(shade(PAL["hat"], 0.2), PAL["hat_d"], (hx, hy - 2), 4))
+    c.stroke([(hx - 3.1, hy - 2.6), (hx + 3.1, hy - 2.6)], 0.42, PAL["band"])
+    c.ellipse(hx - 1.0, hy - 4.3, 1.2, 0.6, hexc("ffffff"), alpha=0.45)  # specular
 
-    # the front arm gets its own outline so it reads clearly over the body
-    layer = new(32, 32)
-    front_hand = arm(p.get("fsh", 10), p.get("fel", 20), PAL["skin"], PAL["shirt_dark"], layer)
+    c.outline(INK, 0.45)
+
+    # front arm on its own layer so it reads clearly over the body
+    a = Canvas(32, 32)
+    hand = arm(a, p.get("fsh", 10), p.get("fel", 20), False)
     if p.get("whip_handle"):
-        d = limb_end(front_hand, p.get("fsh", 0) + p.get("fel", 0), 3)
-        line(layer, front_hand, d, 1, PAL["whip"])
+        tip = limb_end(hand, p.get("fsh", 0) + p.get("fel", 0), 3.0)
+        a.stroke([hand, tip], 0.5, PAL["whip"])
     if p.get("stone"):
-        rect(layer, int(front_hand[0]), int(front_hand[1]) - 1, int(front_hand[0]) + 1, int(front_hand[1]), hexc("8a8a8a"))
-    _ = back_hand
-    img = outline(img)
-    img.alpha_composite(outline(layer, PAL["skin_dark"]))
-    return img
+        a.ellipse(hand[0] + 0.3, hand[1] - 0.6, 1.0, 1.0, Rad(hexc("d8d8d0"), hexc("6a6a64"), (hand[0], hand[1] - 1), 1.3))
+    a.outline(shade(INK, 0.15), 0.35)
+    c.paste(a)
+    return c.final()
 
 
-def run_pose(i, n=6):
+def run_pose(i, n=8):
     ph = 2 * math.pi * i / n
-    s, c = math.sin(ph), math.cos(ph)
+    s, co = math.sin(ph), math.cos(ph)
     return {
-        "lean": 10,
-        "dy": 1 if abs(s) > 0.8 else 0,
+        "lean": 9,
+        "dy": 0.8 * abs(s) - 0.4,
         "fth": 38 * s,
-        "fkn": 15 + 55 * max(0.0, c),
+        "fkn": 15 + 60 * max(0.0, co),
         "bth": -38 * s,
-        "bkn": 15 + 55 * max(0.0, -c),
-        "fsh": -45 * s,
-        "fel": 70,
-        "bsh": 45 * s,
-        "bel": 70,
+        "bkn": 15 + 60 * max(0.0, -co),
+        "fsh": -48 * s,
+        "fel": 75,
+        "bsh": 48 * s,
+        "bel": 75,
     }
 
 
 def rotate_frame(img, deg, pivot, shift=(0, 0)):
-    out = img.rotate(deg, resample=Image.NEAREST, center=pivot, translate=shift)
-    return out
+    return img.rotate(deg, resample=Image.BICUBIC, center=(pivot[0] * S, pivot[1] * S), translate=(shift[0] * S, shift[1] * S))
 
 
 def player_animations():
-    hang = {"fsh": 158, "fel": 4, "bsh": 202, "bel": -4, "lean": 0}
+    hang = {"fsh": 160, "fel": 4, "bsh": 200, "bel": -4, "lean": 0}
     anims = []
-    anims.append(("idle", 3, True, [
+    anims.append(("idle", 4, True, [
         draw_player({"fsh": 8, "bsh": -8, "fel": 10, "bel": 10, "fth": 4, "bth": -4}),
-        draw_player({"dy": 1, "fsh": 10, "bsh": -10, "fel": 14, "bel": 14, "fth": 6, "fkn": 12, "bth": -6, "bkn": 12}),
+        draw_player({"dy": 0.4, "fsh": 9, "bsh": -9, "fel": 12, "bel": 12, "fth": 5, "fkn": 9, "bth": -5, "bkn": 9}),
+        draw_player({"dy": 0.7, "fsh": 10, "bsh": -10, "fel": 14, "bel": 14, "fth": 6, "fkn": 12, "bth": -6, "bkn": 12}),
+        draw_player({"dy": 0.4, "fsh": 9, "bsh": -9, "fel": 12, "bel": 12, "fth": 5, "fkn": 9, "bth": -5, "bkn": 9}),
     ]))
-    anims.append(("run", 12, True, [draw_player(run_pose(i)) for i in range(6)]))
+    anims.append(("run", 14, True, [draw_player(run_pose(i)) for i in range(8)]))
     anims.append(("jump", 8, False, [
         draw_player({"lean": 5, "dy": -3, "fth": 60, "fkn": 85, "bth": 15, "bkn": 70, "fsh": 150, "fel": 10, "bsh": -60, "bel": 40}),
     ]))
@@ -246,398 +397,516 @@ def player_animations():
 # Enemies
 # ---------------------------------------------------------------------------
 def snake_frames():
-    green, dark, belly, red = hexc("3c8c3c"), hexc("24602a"), hexc("c8c040"), hexc("d02020")
+    green, green_d, belly = hexc("5fb84a"), hexc("2d6e2a"), hexc("e8e08a")
     frames = []
     for strike in (False, True):
-        img = new(24, 16)
-        d = ImageDraw.Draw(img)
-        d.ellipse((3, 10, 19, 15), fill=green)
-        d.ellipse((6, 7, 16, 12), fill=green)
-        for x in (5, 9, 13, 17):
-            plot(img, x, 12, dark)
-        if not strike:
-            line(img, (12, 8), (14, 4), 3, green)
-            d.ellipse((13, 2, 19, 6), fill=green)
-            plot(img, 17, 3, hexc("ffe040"))
-            plot(img, 20, 5, red)
+        c = Canvas(24, 16)
+        body = lit(shade(green, 0.2), green_d, (12, 11), 6)
+        c.ellipse(11, 13.2, 8.0, 2.6, body)
+        c.ellipse(11, 10.6, 5.6, 2.3, lit(shade(green, 0.25), green_d, (11, 10), 5))
+        c.stroke([(4, 14.2), (17, 14.2)], 0.6, belly, alpha=0.8)
+        if strike:
+            neck = catmull([(12, 10), (14.5, 7.5), (17.5, 5.6), (19.5, 5.2)])
+            head = (20.3, 5.0)
         else:
-            line(img, (12, 8), (17, 5), 3, green)
-            d.ellipse((17, 3, 23, 7), fill=green)
-            plot(img, 21, 4, hexc("ffe040"))
-            line(img, (23, 6), (23, 7), 1, red)
-        line(img, (7, 14), (17, 14), 1, belly)
-        frames.append(outline(img))
+            neck = catmull([(12, 10), (13, 7.5), (14.2, 5.2), (15.5, 4.2)])
+            head = (16.4, 4.0)
+        c.stroke(neck, 1.6, lit(shade(green, 0.25), green_d, (14, 7), 4), r_end=1.3)
+        c.ellipse(head[0], head[1], 2.6, 1.8, lit(shade(green, 0.3), green_d, head, 3))
+        for i in range(5):  # diamond markings
+            x = 5.5 + i * 2.8
+            c.poly([(x, 12.3), (x + 0.9, 11.4), (x + 1.8, 12.3), (x + 0.9, 13.2)], shade(green_d, -0.2), alpha=0.8)
+        c.ellipse(head[0] + 0.7, head[1] - 0.5, 0.65, 0.65, hexc("ffe14a"))
+        c.ellipse(head[0] + 0.75, head[1] - 0.5, 0.18, 0.5, hexc("101010"))
+        if strike:
+            c.stroke([(head[0] + 2.3, head[1] + 0.5), (head[0] + 3.4, head[1] + 0.6)], 0.18, hexc("e0303a"))
+            c.stroke([(head[0] + 3.4, head[1] + 0.6), (head[0] + 3.8, head[1] + 0.2)], 0.15, hexc("e0303a"))
+            c.stroke([(head[0] + 3.4, head[1] + 0.6), (head[0] + 3.8, head[1] + 1.0)], 0.15, hexc("e0303a"))
+        c.outline(hexc("17301a"), 0.4)
+        frames.append(c.final())
     return frames
 
 
 def scorpion_frames():
-    body, dark, sting = hexc("9c3c1c"), hexc("6a2410"), hexc("f0d040")
+    body, body_d, sting = hexc("d0603a"), hexc("7a2a16"), hexc("ffd84a")
     frames = []
     for f in range(2):
-        img = new(20, 14)
-        d = ImageDraw.Draw(img)
-        # legs
-        for i, x in enumerate((7, 10, 13)):
-            off = 1 if (i + f) % 2 == 0 else -1
-            line(img, (x, 10), (x + off, 13), 1, dark)
-        d.ellipse((5, 7, 15, 11), fill=body)
-        # claws
-        line(img, (14, 9), (17, 8), 1, body)
-        d.ellipse((16, 6, 19, 9), fill=body)
-        # tail curling over the back
-        pts = [(6, 9), (3, 8), (2, 5), (3, 2), (6, 1), (8, 2)]
-        for a, b in zip(pts, pts[1:]):
-            line(img, a, b, 2, body)
-        plot(img, 9, 3 + f, sting)
-        plot(img, 16, 8, hexc("101010"))
-        frames.append(outline(img))
+        c = Canvas(20, 14)
+        for i, x in enumerate((7.0, 9.5, 12.0)):
+            off = 0.8 if (i + f) % 2 == 0 else -0.8
+            c.stroke([(x, 10.0), (x + 0.8 + off, 11.6), (x + off, 13.2)], 0.35, body_d)
+        tail = catmull([(6.5, 9.3), (3.6, 8.6), (2.4, 5.6), (3.4, 2.6), (6.0, 1.6), (8.0, 2.5)])
+        c.stroke(tail, 1.4, lit(shade(body, 0.25), body_d, (4, 5), 4), r_end=0.7)
+        c.poly([(8.0, 2.0), (9.6, 3.3 + f * 0.4), (8.1, 3.4)], sting)
+        c.ellipse(10.5, 9.0, 5.4, 2.4, lit(shade(body, 0.3), body_d, (10, 9), 5))
+        for x in (7.5, 9.5, 11.5):
+            c.stroke([(x, 7.2), (x, 10.6)], 0.15, body_d, alpha=0.7)
+        c.stroke([(15.0, 9.0), (16.8, 8.2)], 0.5, body)
+        c.ellipse(17.6, 7.8, 1.7, 1.2, lit(shade(body, 0.3), body_d, (17.6, 7.8), 2))
+        c.poly([(18.4, 7.0), (19.8, 6.6 + f * 0.3), (18.8, 7.6)], body_d)
+        c.ellipse(14.6, 8.1, 0.38, 0.38, hexc("101010"))
+        c.ellipse(9.5, 7.6, 2.2, 0.5, hexc("ffffff"), alpha=0.35)
+        c.outline(hexc("2a0e06"), 0.35)
+        frames.append(c.final())
     return frames
 
 
 def bat_frames():
-    body, wing, eye = hexc("5a4a6a"), hexc("3a2e4a"), hexc("ff3030")
+    body, wing, wing_l = hexc("6a5a86"), hexc("3a2e52"), hexc("8070a8")
     frames = []
     for up in (True, False):
-        img = new(20, 12)
-        d = ImageDraw.Draw(img)
+        c = Canvas(20, 12)
         if up:
-            d.polygon([(9, 6), (1, 0), (3, 4), (0, 5)], fill=wing)
-            d.polygon([(10, 6), (18, 0), (16, 4), (19, 5)], fill=wing)
+            lw = [(9.2, 6.0), (6.0, 2.0), (1.0, 0.6), (2.6, 3.2), (0.6, 4.6), (3.6, 5.2), (2.8, 7.0)]
         else:
-            d.polygon([(9, 5), (1, 10), (4, 8), (0, 7)], fill=wing)
-            d.polygon([(10, 5), (18, 10), (15, 8), (19, 7)], fill=wing)
-        d.ellipse((7, 3, 12, 9), fill=body)
-        plot(img, 8, 5, eye)
-        plot(img, 11, 5, eye)
-        plot(img, 8, 2, body)
-        plot(img, 11, 2, body)
-        frames.append(outline(img))
+            lw = [(9.2, 5.6), (6.0, 8.6), (1.0, 10.8), (2.8, 8.4), (0.6, 7.6), (3.6, 6.8), (3.2, 5.4)]
+        rw = [(20 - x, y) for x, y in lw]
+        c.poly(lw, lit(wing_l, wing, (5, 5), 5))
+        c.poly(rw, lit(wing_l, wing, (15, 5), 5))
+        for pts in (lw, rw):
+            for j in (2, 4):
+                c.stroke([pts[0], pts[j]], 0.15, shade(wing, -0.3), alpha=0.8)
+        c.poly([(8.4, 3.2), (8.8, 1.6), (9.5, 3.0)], body)
+        c.poly([(11.6, 3.2), (11.2, 1.6), (10.5, 3.0)], body)
+        c.ellipse(10, 6.0, 2.5, 3.0, lit(shade(body, 0.3), shade(body, -0.3), (10, 6), 3))
+        c.blur_layer(lambda t: (t.ellipse(9.0, 5.0, 0.9, 0.9, hexc("ff4040")), t.ellipse(11.0, 5.0, 0.9, 0.9, hexc("ff4040"))), 0.4)
+        c.ellipse(9.0, 5.0, 0.4, 0.4, hexc("ffd0d0"))
+        c.ellipse(11.0, 5.0, 0.4, 0.4, hexc("ffd0d0"))
+        c.outline(hexc("1a1428"), 0.35)
+        frames.append(c.final())
     return frames
 
 
 def croc_frames():
-    green, dark, belly, eye = hexc("4a7a2a"), hexc("2e5418"), hexc("a8b060"), hexc("f0e040")
-    teeth, mouth = hexc("f8f8f0"), hexc("a02828")
+    green, green_d, belly = hexc("6a9a3a"), hexc("2e5418"), hexc("d4cf8a")
     frames = []
     for open_ in (False, True):
-        img = new(48, 20)
-        d = ImageDraw.Draw(img)
-        d.ellipse((12, 9, 47, 19), fill=green)  # back
-        for x in range(16, 44, 4):  # ridges
-            plot(img, x, 9, dark)
-            plot(img, x + 1, 8, dark)
-        d.rectangle((2, 14, 20, 17), fill=green)  # lower jaw
+        c = Canvas(48, 20)
+        c.ellipse(31, 14.0, 16.5, 5.4, lit(shade(green, 0.2), green_d, (31, 12), 9))
+        for i, x in enumerate(range(19, 45, 3)):  # scutes
+            c.ellipse(x + 0.5, 9.3 + 0.15 * (i % 2), 1.2, 0.9, lit(shade(green, 0.3), green_d, (x, 9), 1.5))
+        c.stroke([(19, 17.4), (44, 17.4)], 0.6, belly, alpha=0.7)
+        c.rrect(1.0, 13.0, 21.0, 17.0, 1.8, lit(shade(green, 0.15), green_d, (10, 15), 6))  # lower jaw
         if open_:
-            d.polygon([(20, 13), (6, 13), (6, 15), (20, 15)], fill=mouth)
-            d.polygon([(20, 13), (2, 3), (0, 6), (18, 15)], fill=green)  # upper jaw raised
-            for x in range(4, 18, 3):
-                plot(img, x, 13, teeth)
-                plot(img, x + 1, 7 + (x - 4) // 3, teeth)
+            c.poly([(20.5, 13.2), (4.0, 13.4), (4.0, 15.2), (20.5, 15.4)], hexc("c0505a"))
+            for x in range(5, 19, 2):
+                c.poly([(x, 13.3), (x + 0.6, 12.0), (x + 1.2, 13.3)], hexc("fbfbf0"))
+            upper = [(21.0, 13.2), (3.0, 3.8), (0.6, 6.0), (1.2, 7.4), (19.0, 15.0)]
+            c.poly(upper, lit(shade(green, 0.25), green_d, (10, 8), 7))
+            for i in range(6):
+                x = 4.5 + i * 2.6
+                y = 5.6 + i * 1.35
+                c.poly([(x, y), (x + 0.6, y + 1.3), (x + 1.2, y + 0.4)], hexc("fbfbf0"))
+            c.ellipse(1.8, 5.2, 0.4, 0.3, hexc("1a2a10"))
         else:
-            d.rectangle((0, 11, 20, 14), fill=green)  # upper jaw closed
-            for x in range(3, 18, 3):
-                plot(img, x, 14, teeth)
-            plot(img, 1, 11, dark)
-        d.ellipse((17, 6, 23, 11), fill=green)  # eye bump
-        plot(img, 19, 8, eye)
-        plot(img, 20, 8, hexc("101010"))
-        line(img, (22, 17), (44, 17), 1, belly)
-        frames.append(outline(img))
+            c.rrect(0.0, 10.6, 21.5, 14.4, 1.9, lit(shade(green, 0.25), green_d, (10, 12), 6))
+            for x in range(3, 19, 2):
+                c.poly([(x, 14.2), (x + 0.5, 15.2), (x + 1.0, 14.2)], hexc("fbfbf0"))
+            c.ellipse(1.4, 11.4, 0.45, 0.32, hexc("1a2a10"))
+        c.ellipse(20.0, 9.2, 3.1, 2.6, lit(shade(green, 0.3), green_d, (20, 9), 3))  # eye bump
+        c.ellipse(20.6, 8.6, 1.3, 1.0, hexc("ffd23a"))
+        c.ellipse(20.7, 8.6, 0.25, 0.85, hexc("101010"))
+        c.ellipse(26, 11.0, 6.0, 0.8, hexc("ffffff"), alpha=0.18)
+        c.outline(hexc("142a0c"), 0.4)
+        frames.append(c.final())
     return frames
 
 
 def log_frames():
-    bark, ring, light = hexc("6a4020"), hexc("a07040"), hexc("c89860")
     frames = []
     for f in range(4):
-        img = new(16, 16)
-        d = ImageDraw.Draw(img)
-        d.ellipse((1, 1, 14, 14), fill=bark)
-        d.ellipse((4, 4, 11, 11), fill=ring)
-        d.ellipse((6, 6, 9, 9), fill=light)
+        c = Canvas(16, 16)
+        c.ellipse(8, 8, 7.0, 7.0, lit(hexc("8a5a30"), hexc("4a2c14"), (8, 8), 7))
+        c.ellipse(8, 8, 5.6, 5.6, Rad(hexc("f0c890"), hexc("b4824e"), (8, 8), 5.6))
+        for r in (4.2, 2.8, 1.4):
+            c.fill(ImageChops.subtract(c.m_ellipse(8, 8, r, r), c.m_ellipse(8, 8, r - 0.3, r - 0.3)), hexc("9a6a3a"), alpha=0.7)
         a = -f * math.pi / 2
-        plot(img, 7.5 + math.cos(a) * 5, 7.5 + math.sin(a) * 5, hexc("3a2410"))
-        plot(img, 7.5 + math.cos(a + 0.4) * 5, 7.5 + math.sin(a + 0.4) * 5, hexc("3a2410"))
-        frames.append(outline(img))
+        for d in (0.0, 0.35, -0.35):
+            c.ellipse(8 + math.cos(a + d) * 6.3, 8 + math.sin(a + d) * 6.3, 0.7, 0.7, hexc("3a2210"))
+        c.stroke([(8 + math.cos(a + 1.6) * 1.5, 8 + math.sin(a + 1.6) * 1.5), (8 + math.cos(a + 1.6) * 4.5, 8 + math.sin(a + 1.6) * 4.5)], 0.2, hexc("8a5a30"))
+        c.outline(hexc("2a1608"), 0.4)
+        frames.append(c.final())
     return frames
 
 
 # ---------------------------------------------------------------------------
-# Items (16x16 each, laid out in a single row)
-# ITEM ORDER must match scripts/pickup.gd and scripts/checkpoint.gd
+# Items (16x16 world each, one row). ITEM ORDER must match scripts/entities/
+# pickup.gd and checkpoint.gd
 # ---------------------------------------------------------------------------
+GOLD, GOLD_L, GOLD_D = hexc("f6c33a"), hexc("fff2a8"), hexc("a8700e")
+
+
+def glow(c, cx, cy, r, color, strength=0.6):
+    """Soft halo kept on a layer underneath, so outlines don't trace it."""
+    if getattr(c, "under", None) is None:
+        c.under = Canvas(c.w, c.h, aa=c.k // c.scale, scale=c.scale)
+    c.under.blur_layer(lambda t: t.ellipse(cx, cy, r, r, color, alpha=strength), r * 0.5)
+
+
 def items_sheet():
-    gold, gold_l, gold_d = hexc("f0c030"), hexc("fff090"), hexc("b08010")
-    stone, stone_d, stone_l = hexc("8a8a80"), hexc("5a5a52"), hexc("b0b0a8")
-    tiles = []
+    cells = []
 
-    img = new(16, 16)  # 0 gold bar
-    d = ImageDraw.Draw(img)
-    d.polygon([(2, 12), (13, 12), (11, 6), (4, 6)], fill=gold)
-    line(img, (5, 7), (9, 7), 1, gold_l)
-    line(img, (2, 12), (13, 12), 1, gold_d)
-    tiles.append(outline(img))
+    c = Canvas(16, 16)  # 0 gold bar
+    glow(c, 8, 9, 4, GOLD, 0.35)
+    c.poly([(2, 12.5), (14, 12.5), (11.8, 6.5), (4.2, 6.5)], Lin(GOLD_L, GOLD_D, (5, 6), (11, 13)))
+    c.poly([(4.2, 6.5), (11.8, 6.5), (11, 5.2), (5, 5.2)], GOLD_L)
+    c.poly([(5.6, 7.3), (7.2, 7.3), (5.4, 11.8), (3.8, 11.8)], hexc("ffffff"), alpha=0.5)
+    c.outline(hexc("5a3a06"), 0.4)
+    cells.append(c)
 
-    img = new(16, 16)  # 1 sling stones bag
-    d = ImageDraw.Draw(img)
-    d.ellipse((3, 5, 12, 14), fill=hexc("8a6a3a"))
-    rect(img, 6, 3, 9, 5, hexc("8a6a3a"))
-    line(img, (5, 5), (10, 5), 1, hexc("4a3010"))
-    d.ellipse((5, 8, 8, 11), fill=stone)
-    d.ellipse((8, 9, 11, 12), fill=stone_l)
-    tiles.append(outline(img))
+    c = Canvas(16, 16)  # 1 sling stones pouch
+    c.ellipse(8, 10, 5, 4.3, lit(hexc("b88a52"), hexc("6a4422"), (8, 10), 5))
+    c.poly([(5.5, 6.8), (10.5, 6.8), (9.2, 4.0), (6.8, 4.0)], lit(hexc("b88a52"), hexc("6a4422"), (8, 5), 3))
+    c.stroke([(5.6, 6.6), (10.4, 6.6)], 0.5, hexc("4a2a12"))
+    for x, y, r in ((6.4, 9.6, 1.5), (9.4, 10.6, 1.6), (8.0, 8.4, 1.2)):
+        c.ellipse(x, y, r, r, Rad(hexc("e8e8e0"), hexc("707068"), (x - 0.5, y - 0.5), r * 1.4))
+    c.outline(hexc("2e1a0a"), 0.4)
+    cells.append(c)
 
-    img = new(16, 16)  # 2 canteen (health)
-    d = ImageDraw.Draw(img)
-    d.ellipse((2, 4, 13, 15), fill=hexc("5a7a6a"))
-    d.ellipse((4, 6, 11, 13), fill=hexc("7a9a8a"))
-    rect(img, 6, 1, 9, 4, hexc("8a6a3a"))
-    line(img, (1, 6), (5, 1), 1, hexc("4a3010"))
-    line(img, (14, 6), (10, 1), 1, hexc("4a3010"))
-    line(img, (7, 8), (7, 11), 1, hexc("e04040"))
-    line(img, (6, 9), (8, 9), 1, hexc("e04040"))
-    tiles.append(outline(img))
+    c = Canvas(16, 16)  # 2 canteen
+    c.stroke([(2.5, 7.5), (5.5, 1.5)], 0.45, hexc("7a4a24"))
+    c.stroke([(13.5, 7.5), (10.5, 1.5)], 0.45, hexc("7a4a24"))
+    c.ellipse(8, 9.6, 5.6, 5.6, lit(hexc("8ec0c8"), hexc("3a6a78"), (8, 9.6), 6))
+    c.ellipse(8, 9.6, 4.0, 4.0, Rad(hexc("a8d8e0"), hexc("5a8a96"), (7, 8.5), 5))
+    c.rrect(6.4, 2.6, 9.6, 5.0, 0.8, lit(hexc("c09060"), hexc("6a4422"), (8, 3.8), 2))
+    c.rrect(7.3, 7.0, 8.7, 12.2, 0.4, hexc("e8443a"))
+    c.rrect(5.4, 8.9, 10.6, 10.3, 0.4, hexc("e8443a"))
+    c.ellipse(5.8, 7.0, 1.2, 0.8, hexc("ffffff"), alpha=0.6)
+    c.outline(hexc("1a2a30"), 0.4)
+    cells.append(c)
 
-    img = new(16, 16)  # 3 extra life: golden explorer statuette
-    d = ImageDraw.Draw(img)
-    rect(img, 4, 13, 11, 14, gold_d)
-    rect(img, 6, 6, 9, 12, gold)
-    d.ellipse((5, 2, 10, 7), fill=gold)
-    rect(img, 3, 3, 12, 3, gold_l)
-    rect(img, 5, 1, 10, 2, gold_l)
-    plot(img, 8, 4, gold_d)
-    tiles.append(outline(img))
+    c = Canvas(16, 16)  # 3 extra life: golden explorer statuette
+    glow(c, 8, 8.5, 4.2, GOLD, 0.35)
+    c.rrect(4.2, 13, 11.8, 14.8, 0.6, Lin(GOLD, GOLD_D, (8, 13), (8, 15)))
+    c.stroke([(8, 7.4), (8, 12.5)], 2.0, Lin(GOLD_L, GOLD_D, (6, 8), (10, 12)))
+    c.ellipse(8, 5.6, 2.3, 2.3, Lin(GOLD_L, GOLD_D, (6.5, 4), (9.5, 7.5)))
+    c.ellipse(8, 3.9, 2.6, 2.1, Lin(GOLD_L, GOLD, (7, 2), (9, 5)))
+    c.ellipse(8, 4.6, 4.0, 0.8, Lin(GOLD_L, GOLD_D, (6, 4), (10, 5)))
+    c.ellipse(7.0, 3.2, 0.9, 0.5, hexc("ffffff"), alpha=0.7)
+    c.outline(hexc("5a3a06"), 0.4)
+    cells.append(c)
 
-    for active in (False, True):  # 4 idle checkpoint idol, 5 active
-        img = new(16, 16)
-        body = gold if active else stone
-        dk = gold_d if active else stone_d
-        rect(img, 2, 2, 13, 15, body)
-        rect(img, 2, 2, 13, 3, dk)
-        rect(img, 4, 6, 6, 7, hexc("30e070") if active else dk)
-        rect(img, 9, 6, 11, 7, hexc("30e070") if active else dk)
-        rect(img, 7, 8, 8, 10, dk)
-        rect(img, 4, 12, 11, 12, dk)
-        for x in (4, 6, 8, 10):
-            plot(img, x, 13, dk)
-        rect(img, 0, 4, 1, 9, dk)
-        rect(img, 14, 4, 15, 9, dk)
-        tiles.append(outline(img))
+    for active in (False, True):  # 4 dormant checkpoint idol, 5 awakened
+        c = Canvas(16, 16)
+        if active:
+            glow(c, 8, 8.5, 5, hexc("8affc0"), 0.35)
+        base_l, base_d = (GOLD_L, GOLD_D) if active else (hexc("c4c0b0"), hexc("6a665a"))
+        c.rrect(2.0, 2.0, 14.0, 15.6, 2.0, lit(base_l, base_d, (8, 8), 8))
+        c.rrect(0.6, 4.4, 2.6, 9.6, 0.8, lit(base_l, base_d, (1.5, 7), 3))
+        c.rrect(13.4, 4.4, 15.4, 9.6, 0.8, lit(base_l, base_d, (14.5, 7), 3))
+        c.rrect(2.0, 2.0, 14.0, 4.0, 1.0, shade(base_d, 0.1), alpha=0.8)
+        eye = hexc("50ffa0") if active else shade(base_d, -0.3)
+        if active:
+            c.blur_layer(lambda t: (t.ellipse(5.4, 7.0, 1.6, 1.1, eye), t.ellipse(10.6, 7.0, 1.6, 1.1, eye)), 0.6)
+        c.ellipse(5.4, 7.0, 1.4, 0.9, eye)
+        c.ellipse(10.6, 7.0, 1.4, 0.9, eye)
+        c.rrect(7.2, 8.0, 8.8, 10.6, 0.5, shade(base_d, -0.1), alpha=0.8)
+        c.rrect(4.4, 12.0, 11.6, 13.0, 0.4, shade(base_d, -0.2), alpha=0.9)
+        for x in (5.0, 7.0, 9.0, 11.0):
+            c.rrect(x - 0.4, 13.0, x + 0.4, 14.0, 0.2, shade(base_d, -0.2), alpha=0.9)
+        c.ellipse(5.0, 3.4, 2.0, 0.6, hexc("ffffff"), alpha=0.35)
+        c.outline(hexc("3a3426") if not active else hexc("5a3a06"), 0.4)
+        cells.append(c)
 
-    img = new(16, 16)  # 6 sling stone projectile
-    d = ImageDraw.Draw(img)
-    d.ellipse((6, 6, 9, 9), fill=stone)
-    plot(img, 7, 7, stone_l)
-    tiles.append(outline(img))
+    c = Canvas(16, 16)  # 6 sling stone projectile
+    c.ellipse(8, 8, 1.8, 1.8, Rad(hexc("f0f0e8"), hexc("6a6a62"), (7.3, 7.3), 2.5))
+    c.outline(hexc("2a2a26"), 0.3)
+    cells.append(c)
 
-    sheet = new(16 * len(tiles), 16)
-    for i, t in enumerate(tiles):
-        sheet.paste(t, (i * 16, 0))
+    sheet = Image.new("RGBA", (16 * S * len(cells), 16 * S), (0, 0, 0, 0))
+    for i, cv in enumerate(cells):
+        sheet.paste(cv.final(), (i * 16 * S, 0))
     return sheet
 
 
 # ---------------------------------------------------------------------------
-# Tiles (16x16, laid out in a single row)
-# TILE ORDER must match scripts/level.gd
+# Terrain textures used by scripts/ground_art.gd and props
 # ---------------------------------------------------------------------------
-def tiles_sheet():
-    dirt, dirt_d, dirt_l = hexc("7a4a28"), hexc("5a341a"), hexc("94603a")
-    grass, grass_d, grass_l = hexc("3a8a2a"), hexc("246018"), hexc("6ab84a")
-    brick, brick_d, brick_l = hexc("8a8470"), hexc("5e584a"), hexc("aaa490")
-    moss = hexc("4a7a3a")
-    wood, wood_d, wood_l = hexc("9a6a34"), hexc("6a4420"), hexc("c0905a")
-    tar, tar_l = hexc("1a1420"), hexc("3a3048")
-    water, water_l, water_d = hexc("2a6a8a"), hexc("6ab0c8"), hexc("1a4a6a")
-    out = []
-    rng = [3, 7, 11, 2, 13, 5, 9, 1, 14, 6, 10, 4, 12, 8, 0, 15]
+def wrap_draw(c, period_w, period_h, fn):
+    for ox in (-period_w, 0, period_w):
+        for oy in ((-period_h, 0, period_h) if period_h else (0,)):
+            fn(ox, oy)
 
-    def dirt_tile(rocks):
-        img = Image.new("RGBA", (16, 16), dirt)
-        for i in range(16):
-            plot(img, rng[i], rng[(i * 5) % 16], dirt_d if i % 2 else dirt_l)
-        if rocks:
-            ImageDraw.Draw(img).ellipse((3, 8, 8, 12), fill=hexc("8a8a80"))
-            ImageDraw.Draw(img).ellipse((10, 2, 13, 5), fill=hexc("6a6a62"))
-        return img
 
-    img = dirt_tile(False)  # 0 grass top
-    rect(img, 0, 0, 15, 3, grass)
-    for x in range(0, 16, 2):
-        plot(img, x, 4 + (x // 2) % 2, grass_d)
-        plot(img, x + 1, 0, grass_l)
-    out.append(img)
-    out.append(dirt_tile(False))  # 1 dirt
-    out.append(dirt_tile(True))  # 2 dirt with rocks
+def soil_texture():
+    """Seamless 64x64-world soil."""
+    rng = random.Random(7)
+    c = Canvas(64, 64, aa=2)
+    c.rrect(0, 0, 64, 64, 0, hexc("7a4a2a"))
+    blobs = [(rng.uniform(0, 64), rng.uniform(0, 64), rng.uniform(3, 9), rng.uniform(2, 5), rng.choice([0.08, -0.1, 0.05, -0.15])) for _ in range(60)]
+    for x, y, rx, ry, f in blobs:
+        wrap_draw(c, 64, 64, lambda ox, oy: c.ellipse(x + ox, y + oy, rx, ry, shade(hexc("7a4a2a"), f), alpha=0.6))
+    for _ in range(26):  # pebbles
+        x, y, r = rng.uniform(0, 64), rng.uniform(0, 64), rng.uniform(0.6, 1.8)
+        tone = rng.choice([hexc("a89a88"), hexc("8a7a6a"), hexc("b8a890")])
+        wrap_draw(c, 64, 64, lambda ox, oy: (c.ellipse(x + ox + 0.3, y + oy + 0.4, r, r * 0.8, hexc("3a2210"), alpha=0.5),
+                                             c.ellipse(x + ox, y + oy, r, r * 0.8, Rad(shade(tone, 0.3), shade(tone, -0.2), (x + ox - r * 0.3, y + oy - r * 0.3), r * 1.4))))
+    for _ in range(14):  # roots
+        x, y = rng.uniform(0, 64), rng.uniform(0, 64)
+        pts = [(x, y)]
+        for _ in range(4):
+            x += rng.uniform(1.5, 4)
+            y += rng.uniform(-1.5, 1.5)
+            pts.append((x, y))
+        wrap_draw(c, 64, 64, lambda ox, oy: c.stroke([(px + ox, py + oy) for px, py in pts], 0.35, hexc("4e2e16"), r_end=0.15, alpha=0.7))
+    return c.final()
 
-    def brick_tile(mossy):
-        img = Image.new("RGBA", (16, 16), brick)
-        rect(img, 0, 7, 15, 7, brick_d)
-        rect(img, 0, 15, 15, 15, brick_d)
-        rect(img, 7, 0, 7, 7, brick_d)
-        rect(img, 3, 8, 3, 15, brick_d)
-        rect(img, 12, 8, 12, 15, brick_d)
-        rect(img, 0, 0, 6, 0, brick_l)
-        rect(img, 8, 0, 15, 0, brick_l)
-        rect(img, 4, 8, 11, 8, brick_l)
-        if mossy:
-            for x in range(16):
-                for y in range(0, 2 + (x * 7) % 4):
-                    plot(img, x, y, moss)
-        return img
 
-    out.append(brick_tile(False))  # 3 temple brick
-    out.append(brick_tile(True))  # 4 mossy temple brick
+def grass_texture():
+    """Seamless 64x10-world grass edge; the ground surface sits at y=4."""
+    rng = random.Random(3)
+    c = Canvas(64, 10)
+    base = Lin(hexc("8ad84a"), hexc("2f7a2a"), (0, 3), (0, 9))
+    edge = [(0, 4)] + [(x, 4 + rng.uniform(-0.2, 0.2)) for x in range(2, 64, 2)] + [(64, 4)]
+    bottom = [(x, 7.5 + 1.2 * math.sin(x * 0.7) + rng.uniform(-0.3, 0.3)) for x in range(64, -1, -2)]
+    c.poly(edge + bottom, base)
+    for x in range(0, 64, 4):  # drip shadows into soil
+        c.ellipse(x + 2, 8.2 + 0.8 * math.sin(x), 1.6, 1.0, hexc("2a5a1e"), alpha=0.6)
+    blades = []
+    for _ in range(90):
+        x = rng.uniform(0, 64)
+        h = rng.uniform(1.6, 4.0)
+        lean = rng.uniform(-1.2, 1.2)
+        col = rng.choice([hexc("9ae45a"), hexc("6cc040"), hexc("4fa034")])
+        blades.append((x, h, lean, col))
+    for x, h, lean, col in blades:
+        wrap_draw(c, 64, 0, lambda ox, oy: c.poly([(x + ox - 0.45, 4.6), (x + ox + lean, 4.6 - h), (x + ox + 0.45, 4.6)], Lin(shade(col, 0.25), shade(col, -0.25), (0, 4.6 - h), (0, 4.6))))
+    c.stroke([(0, 4.4), (64, 4.4)], 0.25, hexc("c8f28a"), alpha=0.6)
+    return c.final()
 
-    img = new(16, 16)  # 5 wooden ledge (one-way)
-    rect(img, 0, 0, 15, 4, wood)
-    rect(img, 0, 0, 15, 0, wood_l)
-    rect(img, 0, 4, 15, 4, wood_d)
-    rect(img, 2, 5, 3, 9, wood_d)
-    rect(img, 12, 5, 13, 9, wood_d)
-    plot(img, 7, 2, wood_d)
-    out.append(img)
 
-    img = new(16, 16)  # 6 bridge plank
-    rect(img, 1, 0, 14, 4, wood)
-    rect(img, 1, 0, 14, 0, wood_l)
-    rect(img, 1, 4, 14, 4, wood_d)
-    rect(img, 0, 1, 0, 2, hexc("c8b080"))
-    rect(img, 15, 1, 15, 2, hexc("c8b080"))
-    out.append(img)
+def stone_block(mossy):
+    c = Canvas(16, 16)
+    base = hexc("a8a290")
+    c.rrect(0, 0, 16, 16, 0, hexc("5e584a"))
+    c.rrect(0.35, 0.35, 15.65, 15.65, 1.2, lit(shade(base, 0.2), shade(base, -0.25), (8, 8), 9))
+    c.rrect(1.2, 1.2, 14.8, 14.8, 1.0, lit(shade(base, 0.05), shade(base, -0.12), (8, 8), 8))
+    c.stroke([(3.5, 4.0), (5.5, 6.5), (5.0, 8.5)], 0.18, shade(base, -0.4), alpha=0.7)
+    c.stroke([(11.0, 10.0), (12.5, 12.6)], 0.18, shade(base, -0.4), alpha=0.7)
+    c.ellipse(4.0, 2.2, 3.0, 0.5, hexc("ffffff"), alpha=0.25)
+    if mossy:
+        rng = random.Random(5)
+        pts = [(0, 0), (16, 0)] + [(x, 2.0 + 1.6 * math.sin(x * 0.9) + rng.uniform(0, 0.8)) for x in range(16, -1, -1)]
+        c.poly(pts, Lin(hexc("8ad04e"), hexc("3a7a2a"), (0, 0), (0, 4)))
+        for x in (2.5, 7.0, 12.5):
+            c.ellipse(x, 3.6 + rng.uniform(0, 1), 1.0, 0.7, hexc("4a8a32"))
+    return c.final()
 
-    img = new(16, 16)  # 7 vine segment
-    rect(img, 7, 0, 8, 15, hexc("4a8a2a"))
-    rect(img, 7, 0, 7, 15, hexc("2e6018"))
-    rect(img, 9, 3, 11, 4, hexc("6ab84a"))
-    rect(img, 4, 10, 6, 11, hexc("6ab84a"))
-    out.append(img)
 
-    img = Image.new("RGBA", (16, 16), tar)  # 8 tar surface
-    rect(img, 0, 0, 15, 1, tar_l)
-    ImageDraw.Draw(img).ellipse((4, 1, 7, 4), outline=tar_l)
-    plot(img, 12, 2, tar_l)
-    out.append(img)
-    img = Image.new("RGBA", (16, 16), tar)  # 9 tar body
-    plot(img, 3, 6, tar_l)
-    plot(img, 11, 11, tar_l)
-    out.append(img)
+def wood_plank(w, h, rope):
+    c = Canvas(w, h)
+    c.rrect(0.3, 0.2, w - 0.3, h - 0.4, 1.0, lit(hexc("d8a466"), hexc("7a4a22"), (w / 2, h / 2), h))
+    for y in (h * 0.35, h * 0.62):
+        c.stroke([(1.2, y), (w - 1.2, y + 0.2)], 0.12, hexc("6a3a18"), alpha=0.6)
+    c.ellipse(w * 0.66, h * 0.45, 0.7, 0.4, hexc("6a3a18"), alpha=0.7)
+    c.stroke([(1.0, 0.8), (w - 1.0, 0.8)], 0.25, hexc("fff0c8"), alpha=0.5)
+    if rope:
+        for x in (1.6, w - 1.6):
+            c.rrect(x - 0.7, -0.2, x + 0.7, h, 0.3, Lin(hexc("e8d8a8"), hexc("9a8458"), (x - 0.7, 0), (x + 0.7, 0)))
+    c.outline(hexc("3a2210"), 0.3)
+    return c.final()
 
-    img = Image.new("RGBA", (16, 16), water)  # 10 water surface
-    for x in range(16):
-        plot(img, x, 1 + int(math.sin(x / 16 * 2 * math.pi) * 1.5), water_l)
-    rect(img, 2, 6, 5, 6, water_l)
-    out.append(img)
-    img = Image.new("RGBA", (16, 16), water_d)  # 11 water body
-    rect(img, 9, 5, 12, 5, water)
-    rect(img, 2, 12, 4, 12, water)
-    out.append(img)
 
-    sheet = new(16 * len(out), 16)
-    for i, t in enumerate(out):
-        sheet.paste(t, (i * 16, 0))
-    return sheet
+def ledge_texture():
+    c = Canvas(16, 10)
+    c.rrect(0, 0.2, 16, 4.6, 1.2, lit(hexc("d8a466"), hexc("7a4a22"), (8, 2), 5))
+    c.stroke([(0.5, 2.3), (15.5, 2.5)], 0.12, hexc("6a3a18"), alpha=0.6)
+    c.stroke([(0.5, 0.9), (15.5, 0.9)], 0.25, hexc("fff0c8"), alpha=0.5)
+    for x in (3.0, 13.0):
+        c.stroke([(x, 4.4), (x - 1.5, 9.6)], 0.55, lit(hexc("b88450"), hexc("5a3418"), (x, 6), 3))
+    c.outline(hexc("3a2210"), 0.3)
+    return c.final()
+
+
+def vine_texture():
+    """Seamless vertical vine segment, 16x16 world."""
+    c = Canvas(16, 16)
+    for phase, col in ((0.0, hexc("4f9a32")), (math.pi, hexc("3a7a26"))):
+        def strand(ox, oy, phase=phase, col=col):
+            pts = [(8 + 1.0 * math.sin(y / 16 * 2 * math.pi + phase), y + oy) for y in np.linspace(-1, 17, 19)]
+            c.stroke(pts, 0.7, lit(shade(col, 0.3), shade(col, -0.3), (8, 8), 2))
+        wrap_draw(c, 0, 16, strand)
+    for y, side in ((3.0, 1), (11.0, -1)):
+        def leaf(ox, oy, y=y, side=side):
+            cx = 8 + side * 3.0
+            c.poly([(8, y + oy), (cx, y + oy - 1.6), (8 + side * 5.2, y + oy + 0.4), (cx, y + oy + 1.4)], Lin(hexc("9ae060"), hexc("2f7a2a"), (8, y + oy - 1), (8 + side * 5, y + oy + 1)))
+            c.stroke([(8, y + oy), (8 + side * 4.6, y + oy + 0.3)], 0.12, hexc("2a6020"), alpha=0.6)
+        wrap_draw(c, 0, 16, leaf)
+    return c.final()
 
 
 def temple_facade():
-    """Mayan step-temple used for the level exit (112x96)."""
+    """Mayan step-temple for the level exit (112x96 world)."""
     w, h = 112, 96
-    img = new(w, h)
-    stone, dark, light, moss = hexc("9a9078"), hexc("6a6250"), hexc("bab098"), hexc("4a7a3a")
+    c = Canvas(w, h, aa=2)
+    stone_l, stone_d = hexc("c8bea2"), hexc("7a7058")
     steps = 5
     for i in range(steps):
-        x0 = 4 + i * 10
-        x1 = w - 5 - i * 10
-        y1 = h - 1 - i * 14
-        y0 = y1 - 13
-        rect(img, x0, y0, x1, y1, stone)
-        rect(img, x0, y0, x1, y0, light)
-        rect(img, x0, y1, x1, y1, dark)
-        for x in range(x0 + 3, x1, 8):
-            rect(img, x, y0 + 4, x + 3, y0 + 7, dark)
-        for x in range(x0, x1, 5):
-            plot(img, x, y0 + 1, moss)
-    # roof shrine
-    rect(img, 44, 12, 67, 26, stone)
-    rect(img, 44, 12, 67, 12, light)
-    rect(img, 50, 16, 61, 26, dark)
-    # doorway (player walks into this)
-    rect(img, 44, 56, 67, 95, hexc("140c08"))
-    rect(img, 42, 54, 69, 55, light)
-    rect(img, 42, 54, 43, 95, dark)
-    rect(img, 68, 54, 69, 95, dark)
-    # glyph eyes above door
-    rect(img, 48, 46, 51, 49, hexc("f0c030"))
-    rect(img, 60, 46, 63, 49, hexc("f0c030"))
-    return outline(img)
+        x0, x1 = 4 + i * 10, w - 4 - i * 10
+        y1 = h - i * 14
+        y0 = y1 - 14
+        c.rrect(x0, y0, x1, y1, 1.0, lit(stone_l, stone_d, ((x0 + x1) / 2, (y0 + y1) / 2), 30))
+        c.rrect(x0, y0, x1, y0 + 1.2, 0.6, hexc("ffffff"), alpha=0.25)
+        c.rrect(x0, y1 - 1.5, x1, y1, 0.6, hexc("2a2418"), alpha=0.25)
+        for x in range(x0 + 4, x1 - 4, 9):
+            c.rrect(x, y0 + 4, x + 5, y0 + 9, 1.0, Lin(hexc("6a6250"), hexc("9a907a"), (x, y0 + 4), (x + 5, y0 + 9)), alpha=0.9)
+        rng = random.Random(i)
+        for _ in range(6):
+            mx = rng.uniform(x0 + 2, x1 - 2)
+            c.ellipse(mx, y0 + 0.8, rng.uniform(1.5, 3.5), 1.0, hexc("5a9a3a"), alpha=0.9)
+    c.rrect(42, 10, 70, 27, 1.0, lit(stone_l, stone_d, (56, 18), 14))
+    c.rrect(48, 14, 64, 27, 2.0, Lin(hexc("1a120c"), hexc("3a2a1c"), (56, 14), (56, 27)))
+    c.poly([(40, 10), (72, 10), (66, 5), (46, 5)], lit(stone_l, stone_d, (56, 7), 10))
+    # doorway (the player walks into this)
+    c.rrect(42, 52, 70, 96, 1.5, lit(stone_l, stone_d, (56, 70), 20))
+    c.fill(c.m_rrect(44.5, 56, 67.5, 96, 6.0), Lin(hexc("05030a"), hexc("2a1c12"), (56, 60), (56, 96)))
+    # glowing glyph eyes above the door
+    for x in (49.5, 62.5):
+        c.blur_layer(lambda t, x=x: t.ellipse(x, 47.5, 3.0, 2.2, hexc("ffd040")), 1.0)
+        c.ellipse(x, 47.5, 1.8, 1.3, hexc("fff2b0"))
+    # hanging vines
+    rng = random.Random(11)
+    for x in (12, 30, 84, 100):
+        ln = rng.uniform(12, 26)
+        y0 = h - 14 * (2 if x in (30, 84) else 1) + 0.5
+        pts = [(x + 0.8 * math.sin(t * 0.5), y0 + t) for t in np.linspace(0, ln, 8)]
+        c.stroke(pts, 0.6, hexc("4a8a2e"))
+        for t in range(2, int(ln), 4):
+            c.ellipse(x + 1.2 * (-1) ** t, y0 + t, 1.2, 0.7, hexc("6ab84a"))
+    c.outline(hexc("2a2418"), 0.35)
+    return c.final()
+
+
+def leaf_particle():
+    c = Canvas(8, 8)
+    c.poly([(1, 4), (4, 1.4), (7, 4), (4, 6.6)], Lin(hexc("b8e070"), hexc("4a8a2a"), (2, 2), (6, 6)))
+    c.stroke([(1.2, 4), (6.8, 4)], 0.15, hexc("3a6a20"), alpha=0.7)
+    return c.final()
+
+
+def glow_particle():
+    c = Canvas(8, 8)
+    c.blur_layer(lambda t: t.ellipse(4, 4, 2.0, 2.0, hexc("fff6b0")), 1.0)
+    c.ellipse(4, 4, 0.8, 0.8, hexc("ffffff"))
+    return c.final()
 
 
 # ---------------------------------------------------------------------------
-# Parallax backgrounds (480x270, tile horizontally)
+# Parallax backgrounds (480x270 world, the scrolling ones tile horizontally)
 # ---------------------------------------------------------------------------
+BW, BH = 480, 270
+
+
+def bg_sky():
+    c = Canvas(BW, BH, aa=1)
+    c.rrect(0, 0, BW, BH, 0, Lin(hexc("16566e"), hexc("f6dda0"), (0, 0), (0, 215)))
+    c.blur_layer(lambda t: t.ellipse(330, 150, 90, 70, hexc("fff0b8"), alpha=0.7), 30)
+    c.ellipse(330, 150, 18, 18, Rad(hexc("fffbe8"), hexc("ffe8a0"), (330, 150), 18), alpha=0.9)
+    rng = random.Random(2)
+    def clouds(t):
+        for _ in range(9):
+            x, y = rng.uniform(0, BW), rng.uniform(30, 120)
+            for j in range(4):
+                t.ellipse(x + j * 14 - 20, y + rng.uniform(-4, 4), rng.uniform(14, 26), rng.uniform(6, 10), hexc("ffffff"), alpha=0.35)
+    c.blur_layer(clouds, 5)
+    return c.final()
+
+
+def periodic(x, seed, amps):
+    return sum(a * math.sin(2 * math.pi * f * x / BW + seed * (i + 1)) for i, (a, f) in enumerate(amps))
+
+
 def bg_far():
-    w, h = 480, 270
-    img = new(w, h)
-    top, bottom = hexc("1e5a6a"), hexc("c8d890")
-    for y in range(h):
-        t = y / (h - 1)
-        c = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)) + (255,)
-        for x in range(w):
-            img.putpixel((x, y), c)
-    d = ImageDraw.Draw(img)
-    hill = hexc("6a9a6a")
-    pts = [(0, h)]
-    for x in range(0, w + 1, 8):
-        pts.append((x, 170 + 18 * math.sin(x / w * 2 * math.pi * 2) + 8 * math.sin(x / 23.0)))
-    pts.append((w, h))
-    d.polygon(pts, fill=hill)
-    # distant pyramid silhouette
-    pyr = hexc("4e7a5a")
+    c = Canvas(BW, BH, aa=1)
+    for depth, (top, col, amps) in enumerate((
+        (150, hexc("8fb8a8"), [(18, 2), (9, 5), (4, 11)]),
+        (172, hexc("6f9e88"), [(14, 3), (7, 7), (3, 13)]),
+    )):
+        pts = [(x, top + periodic(x, depth + 1, amps)) for x in range(0, BW + 1, 4)]
+        c.poly(pts + [(BW, BH), (0, BH)], Lin(shade(col, 0.1), shade(col, -0.1), (0, top - 20), (0, BH)))
+    # hazy pyramid
+    col = hexc("7aa596")
     for i in range(6):
-        d.rectangle((300 + i * 7, 200 - (i + 1) * 14, 380 - i * 7, 200 - i * 14), fill=pyr)
-    d.rectangle((332, 104, 348, 116), fill=pyr)
-    return img
+        c.rrect(300 + i * 7, 196 - (i + 1) * 13, 380 - i * 7, 197 - i * 13, 0.5, lit(shade(col, 0.12), shade(col, -0.08), (340, 160), 40))
+    c.rrect(333, 108, 347, 119, 0.5, col)
+    c.rrect(0, 150, BW, BH, 0, Lin(hexc("e8e0b0", 0), hexc("dfe6c0", 160), (0, 150), (0, 230)))
+    return c.final()
+
+
+def tree_canopy(c, x, y, r, base, rng, ox=0):
+    for _ in range(7):
+        bx = x + rng.uniform(-r, r) + ox
+        by = y + rng.uniform(-r * 0.5, r * 0.4)
+        br = r * rng.uniform(0.45, 0.75)
+        c.ellipse(bx, by, br, br * 0.85, lit(shade(base, 0.22), shade(base, -0.25), (bx, by), br))
 
 
 def bg_mid():
-    w, h = 480, 270
-    img = new(w, h)
-    d = ImageDraw.Draw(img)
-    trunk, trunk_d = hexc("3a4a2a"), hexc("2a3a1e")
-    leaf, leaf_d = hexc("2e6a2a"), hexc("1e4a1e")
-    for i, x in enumerate(range(20, w, 70)):
-        tw = 10 + (i * 7) % 8
-        d.rectangle((x, 60, x + tw, h), fill=trunk)
-        d.rectangle((x, 60, x + 2, h), fill=trunk_d)
-    for x in range(-20, w + 20, 34):
-        r = 24 + (x * 13) % 14
-        cy = 40 + (x * 7) % 30
-        d.ellipse((x - r, cy - r, x + r, cy + r), fill=leaf_d)
-        d.ellipse((x - r + 6, cy - r + 4, x + r - 6, cy + r - 8), fill=leaf)
-    d.rectangle((0, 0, w, 20), fill=leaf_d)
-    # undergrowth
-    for x in range(0, w, 12):
-        r = 10 + (x * 5) % 8
-        d.ellipse((x - r, 236 - r, x + r, 236 + r), fill=leaf_d)
-    d.rectangle((0, 236, w, h), fill=leaf_d)
-    # hanging vines (decorative)
-    for x in range(45, w, 95):
-        ln = 50 + (x * 3) % 60
-        d.line((x, 20, x, 20 + ln), fill=hexc("3a7a2a"), width=2)
-    return img
+    c = Canvas(BW, BH, aa=1)
+    rng = random.Random(4)
+    trunk = hexc("4a6a52")
+    trees = [(x, rng.uniform(8, 14)) for x in range(30, BW, 80)]
+    for x, tw in trees:
+        wrap_draw(c, BW, 0, lambda ox, oy: c.rrect(x + ox, 70, x + ox + tw, BH, 2, Lin(shade(trunk, 0.1), shade(trunk, -0.2), (x + ox, 0), (x + ox + tw, 0))))
+    canopies = [(x, rng.uniform(40, 80), rng.uniform(28, 40)) for x in range(0, BW, 40)]
+    for x, y, r in canopies:
+        state = rng.getstate()
+        for ox in (-BW, 0, BW):
+            rng.setstate(state)
+            tree_canopy(c, x, y, r, hexc("3f7a5a"), rng, ox)
+    bush = [(x, rng.uniform(220, 232), rng.uniform(16, 26)) for x in range(0, BW, 22)]
+    for x, y, r in bush:
+        wrap_draw(c, BW, 0, lambda ox, oy: c.ellipse(x + ox, y, r, r * 0.7, lit(hexc("3f7a5a"), hexc("24503a"), (x + ox, y), r)))
+    c.rrect(0, 232, BW, BH, 0, hexc("24503a"))
+    c.rrect(0, 0, BW, BH, 0, Lin(hexc("cfe3c8", 70), hexc("cfe3c8", 0), (0, 120), (0, 260)))
+    return c.final()
+
+
+def bg_near():
+    c = Canvas(BW, BH, aa=1)
+    rng = random.Random(9)
+    trunk = hexc("5a4a32")
+    for x in (40, 200, 330, 430):
+        tw = rng.uniform(16, 24)
+        def draw_trunk(ox, oy, x=x, tw=tw):
+            c.poly([(x + ox - 3, BH), (x + ox + 2, 0), (x + ox + tw - 2, 0), (x + ox + tw + 4, BH)], Lin(shade(trunk, 0.2), shade(trunk, -0.35), (x + ox, 0), (x + ox + tw, 0)))
+            for yy in range(20, BH, 26):
+                c.stroke([(x + ox + 3, yy), (x + ox + tw * 0.6, yy + 6)], 0.6, shade(trunk, -0.4), alpha=0.5)
+        wrap_draw(c, BW, 0, draw_trunk)
+    def rays(t):
+        for x in (80, 180, 300, 420):
+            t.poly([(x, 0), (x + 26, 0), (x - 60, BH), (x - 110, BH)], hexc("fff4c0"), alpha=0.18)
+    c.blur_layer(rays, 6)
+    for x in range(0, BW, 34):
+        state = rng.getstate()
+        for ox in (-BW, 0, BW):
+            rng.setstate(state)
+            tree_canopy(c, x, rng.uniform(4, 26), rng.uniform(22, 32), hexc("2f6a2a"), rng, ox)
+    for x in range(25, BW, 60):  # hanging vines
+        ln = rng.uniform(40, 120)
+        def hanging(ox, oy, x=x, ln=ln):
+            pts = [(x + ox + 2 * math.sin(t * 0.08), 20 + t) for t in np.linspace(0, ln, 12)]
+            c.stroke(pts, 0.9, hexc("3d7a2a"))
+            for t in range(8, int(ln), 10):
+                side = 1 if t % 20 else -1
+                c.ellipse(x + ox + side * 2.2 + 2 * math.sin(t * 0.08), 20 + t, 2.4, 1.2, hexc("5aa040"))
+        wrap_draw(c, BW, 0, hanging)
+    return c.final()
 
 
 # ---------------------------------------------------------------------------
 # Sheet + SpriteFrames writers
 # ---------------------------------------------------------------------------
 def write_sheet(name, anims, fw, fh):
-    """anims: list of (name, fps, loop, [frames]). One animation per row."""
+    """anims: list of (name, fps, loop, [frames]). One animation per row.
+    fw/fh are in world units; the sheet is stored at S pixels per unit."""
+    pw, ph = fw * S, fh * S
     cols = max(len(a[3]) for a in anims)
-    sheet = new(cols * fw, len(anims) * fh)
+    sheet = Image.new("RGBA", (cols * pw, len(anims) * ph), (0, 0, 0, 0))
     for r, (_, _, _, frames) in enumerate(anims):
         for c, f in enumerate(frames):
-            sheet.paste(f, (c * fw, r * fh))
-    png = os.path.join(SPRITES, name + ".png")
-    sheet.save(png)
+            sheet.paste(f, (c * pw, r * ph))
+    sheet.save(os.path.join(SPRITES, name + ".png"), optimize=True)
 
     subs = []
     anim_entries = []
@@ -649,11 +918,9 @@ def write_sheet(name, anims, fw, fh):
             subs.append(
                 f'[sub_resource type="AtlasTexture" id="AtlasTexture_{sid}"]\n'
                 f'atlas = ExtResource("1_sheet")\n'
-                f"region = Rect2({c * fw}, {r * fh}, {fw}, {fh})\n"
+                f"region = Rect2({c * pw}, {r * ph}, {pw}, {ph})\n"
             )
-            frame_refs.append(
-                '{\n"duration": 1.0,\n"texture": SubResource("AtlasTexture_%d")\n}' % sid
-            )
+            frame_refs.append('{\n"duration": 1.0,\n"texture": SubResource("AtlasTexture_%d")\n}' % sid)
         anim_entries.append(
             '{\n"frames": [%s],\n"loop": %s,\n"name": &"%s",\n"speed": %.1f\n}'
             % (", ".join(frame_refs), "true" if loop else "false", aname, fps)
@@ -670,22 +937,36 @@ def write_sheet(name, anims, fw, fh):
         fh_.write(tres)
 
 
+def save(img, *parts):
+    img.save(os.path.join(ROOT, *parts), optimize=True)
+
+
 def main():
-    for d in (SPRITES, TILES, BG):
+    for d in (SPRITES, TILES, BG, FX):
         os.makedirs(d, exist_ok=True)
     write_sheet("player", player_animations(), 32, 32)
     s = snake_frames()
     write_sheet("snake", [("idle", 3, True, [s[0]]), ("strike", 1, False, [s[1]])], 24, 16)
     write_sheet("scorpion", [("walk", 6, True, scorpion_frames())], 20, 14)
     write_sheet("bat", [("fly", 8, True, bat_frames())], 20, 12)
-    c = croc_frames()
-    write_sheet("croc", [("closed", 1, False, [c[0]]), ("open", 1, False, [c[1]])], 48, 20)
+    cr = croc_frames()
+    write_sheet("croc", [("closed", 1, False, [cr[0]]), ("open", 1, False, [cr[1]])], 48, 20)
     write_sheet("log", [("roll", 10, True, log_frames())], 16, 16)
-    items_sheet().save(os.path.join(SPRITES, "items.png"))
-    temple_facade().save(os.path.join(SPRITES, "temple.png"))
-    tiles_sheet().save(os.path.join(TILES, "jungle_tiles.png"))
-    bg_far().save(os.path.join(BG, "bg_far.png"))
-    bg_mid().save(os.path.join(BG, "bg_mid.png"))
+    save(items_sheet(), "assets", "sprites", "items.png")
+    save(temple_facade(), "assets", "sprites", "temple.png")
+    save(soil_texture(), "assets", "tiles", "soil.png")
+    save(grass_texture(), "assets", "tiles", "grass.png")
+    save(stone_block(False), "assets", "tiles", "stone.png")
+    save(stone_block(True), "assets", "tiles", "stone_moss.png")
+    save(ledge_texture(), "assets", "tiles", "ledge.png")
+    save(wood_plank(16, 6, True), "assets", "tiles", "bridge_plank.png")
+    save(vine_texture(), "assets", "tiles", "vine.png")
+    save(leaf_particle(), "assets", "fx", "leaf.png")
+    save(glow_particle(), "assets", "fx", "glow.png")
+    save(bg_sky(), "assets", "backgrounds", "sky.png")
+    save(bg_far(), "assets", "backgrounds", "far.png")
+    save(bg_mid(), "assets", "backgrounds", "mid.png")
+    save(bg_near(), "assets", "backgrounds", "near.png")
     print("art generated")
 
 

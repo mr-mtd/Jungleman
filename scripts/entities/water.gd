@@ -2,7 +2,6 @@ class_name Water
 extends Area2D
 ## Deep water. Falling in is fatal, so hop across on the crocodiles.
 
-const TilesTexture := preload("res://assets/tiles/jungle_tiles.png")
 const KILL_DEPTH := 6.0
 
 var size := Vector2(64, 32)
@@ -28,17 +27,25 @@ func _process(delta: float) -> void:
 
 
 func _draw() -> void:
-	var shift := fmod(_time * 8.0, 16.0)
-	var x := -16.0
-	while x < size.x:
-		var dx := x + shift
-		var left := maxf(dx, 0.0)
-		var right := minf(dx + 16.0, size.x)
-		if right > left:
-			var src_x := left - dx
-			draw_texture_rect_region(TilesTexture, Rect2(left, 0, right - left, 16), Rect2(160 + src_x, 0, right - left, 16), Color(1, 1, 1, 0.9))
-			var y := 16.0
-			while y < size.y:
-				draw_texture_rect_region(TilesTexture, Rect2(left, y, right - left, 16), Rect2(176 + src_x, 0, right - left, 16), Color(1, 1, 1, 0.9))
-				y += 16.0
-		x += 16.0
+	var w := size.x
+	var h := size.y
+	var top := PackedVector2Array()
+	for i in int(w / 2.0) + 1:
+		var x := i * 2.0
+		top.append(Vector2(x, sin(x * 0.18 + _time * 2.0) * 0.9 + sin(x * 0.07 - _time * 1.3) * 0.6))
+	var body := PackedVector2Array(top)
+	body.append(Vector2(w, h))
+	body.append(Vector2(0, h))
+	var colors := PackedColorArray()
+	for p in body:
+		colors.append(Color("3aa6c8").lerp(Color("0c3552"), clampf(p.y / h, 0.0, 1.0)) * Color(1, 1, 1, 0.88))
+	draw_polygon(body, colors)
+	# foam line and soft highlight
+	draw_polyline(top, Color(0.85, 0.97, 1.0, 0.9), 0.8, true)
+	draw_polyline(top, Color(0.85, 0.97, 1.0, 0.25), 2.6, true)
+	# drifting caustic glints
+	for i in int(w / 14.0):
+		var gx := fmod(i * 17.0 + _time * (6.0 + i % 3), w - 8.0) + 2.0
+		var gy := 4.0 + fmod(i * 7.0, maxf(h - 8.0, 1.0))
+		var a := 0.12 + 0.1 * sin(_time * 2.0 + i)
+		draw_line(Vector2(gx, gy), Vector2(gx + 4.0 + (i % 3), gy), Color(1, 1, 1, a), 0.8, true)

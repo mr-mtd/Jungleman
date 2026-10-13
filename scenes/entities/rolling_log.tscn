@@ -18,6 +18,7 @@ script = ExtResource("1")
 shape = SubResource("body")
 
 [node name="Sprite" type="AnimatedSprite2D" parent="."]
+scale = Vector2(0.25, 0.25)
 sprite_frames = ExtResource("2")
 animation = &"roll"
 

@@ -28,4 +28,4 @@ func _on_body_entered(body: Node) -> void:
 
 func _activate() -> void:
 	active = true
-	sprite.region_rect = Rect2(80, 0, 16, 16)
+	sprite.region_rect = Rect2(320, 0, 64, 64)

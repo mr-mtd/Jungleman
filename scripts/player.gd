@@ -97,6 +97,7 @@ func _physics_process(delta: float) -> void:
 	_update_attacks(delta)
 	_update_animation()
 	sprite.visible = invuln <= 0.0 or state == State.DEAD or int(invuln * 20) % 2 == 0
+	queue_redraw()
 	if state != State.DEAD and global_position.y > kill_y:
 		die()
 
@@ -366,6 +367,16 @@ func win() -> void:
 
 
 # --- Animation ---------------------------------------------------------------
+
+func _draw() -> void:
+	# soft contact shadow under the feet
+	if state == State.NORMAL and is_on_floor() and not _in_tar():
+		for i in 3:
+			var r := 7.0 - i * 1.8
+			draw_set_transform(Vector2(0, STAND_HEIGHT / 2.0), 0.0, Vector2(1.0, 0.3))
+			draw_circle(Vector2.ZERO, r, Color(0, 0, 0, 0.12))
+		draw_set_transform(Vector2.ZERO)
+
 
 func _update_animation() -> void:
 	sprite.flip_h = facing < 0

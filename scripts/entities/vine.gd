@@ -6,8 +6,7 @@ extends Node2D
 const GRAVITY := 900.0
 const PUMP_STRENGTH := 2.2
 const MAX_ANGLE := 1.15
-const VINE_REGION := Rect2(112, 0, 16, 16)
-const TilesTexture := preload("res://assets/tiles/jungle_tiles.png")
+const VineTexture := preload("res://assets/tiles/vine.png")
 
 @export var length := 96.0
 @export var rest_amplitude := 0.6  ## radians the vine swings when nobody hangs on it
@@ -47,13 +46,19 @@ func _physics_process(delta: float) -> void:
 
 
 func _draw() -> void:
-	draw_rect(Rect2(-5, -4, 10, 5), Color("5a3a1c"))
+	# a knotted branch stub the vine hangs from
+	draw_circle(Vector2(0, -1), 3.2, Color("4a2e16"))
+	draw_circle(Vector2(-0.8, -1.8), 1.4, Color("7a5230"))
+	var tex_h := VineTexture.get_height()
 	var y := 0.0
 	while y < length:
 		var h := minf(16.0, length - y)
-		draw_texture_rect_region(TilesTexture, Rect2(-8, y, 16, h), Rect2(VINE_REGION.position, Vector2(16, h)))
+		draw_texture_rect_region(VineTexture, Rect2(-8, y, 16, h), Rect2(0, 0, VineTexture.get_width(), tex_h * h / 16.0))
 		y += 16.0
-	draw_rect(Rect2(-3, length - 2, 6, 4), Color("6ab84a"))
+	# leafy tuft at the tip
+	draw_circle(Vector2(-1.5, length - 1.0), 2.4, Color("4f9a32"))
+	draw_circle(Vector2(1.6, length), 2.0, Color("6cc040"))
+	draw_circle(Vector2(0.0, length + 1.6), 1.6, Color("3a7a26"))
 
 
 ## Unit vector pointing from the anchor down the vine.
