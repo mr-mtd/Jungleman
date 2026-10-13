@@ -11,9 +11,16 @@ func _ready() -> void:
 
 
 func _draw() -> void:
-	draw_line(Vector2.ZERO, end_offset, Color("c8b080"), 1.5)
-	draw_rect(Rect2(-3, -4, 6, 6), Color("5a3a1c"))
-	draw_rect(Rect2(end_offset.x - 3, end_offset.y - 4, 6, 6), Color("5a3a1c"))
+	var sag := PackedVector2Array()
+	for i in 21:
+		var t := i / 20.0
+		sag.append(end_offset * t + Vector2(0, sin(t * PI) * 2.0))
+	draw_polyline(sag, Color(0.2, 0.13, 0.06, 0.5), 2.2, true)
+	draw_polyline(sag, Color("d8c08a"), 1.1, true)
+	for p in [Vector2.ZERO, end_offset]:
+		draw_circle(p, 3.0, Color("4a2e16"))
+		draw_circle(p, 1.8, Color("a07040"))
+		draw_circle(p + Vector2(-0.6, -0.6), 0.7, Color(1, 1, 1, 0.4))
 
 
 func length() -> float:

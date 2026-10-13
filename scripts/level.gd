@@ -33,10 +33,9 @@ const PickupScene := preload("res://scenes/entities/pickup.tscn")
 const CheckpointScene := preload("res://scenes/entities/checkpoint.tscn")
 const ExitScene := preload("res://scenes/entities/exit_door.tscn")
 const HudScene := preload("res://scenes/ui/hud.tscn")
-const TilesTexture := preload("res://assets/tiles/jungle_tiles.png")
+const AmbienceScript := preload("res://scripts/fx/ambience.gd")
 
-# Atlas columns in assets/tiles/jungle_tiles.png
-enum T { GRASS, DIRT, DIRT_ROCKS, BRICK, BRICK_MOSS, LEDGE, PLANK, VINE, TAR_TOP, TAR, WATER_TOP, WATER }
+enum Collision { SOLID, LEDGE }
 
 @export var map_script: Script = preload("res://levels/level_1_map.gd")
 @export var level_title := "LEVEL 1 - THE MAYAN JUNGLE"
@@ -47,6 +46,7 @@ var height := 0
 var player: Player
 
 @onready var ground: TileMapLayer = $Ground
+@onready var ground_art: Node2D = $GroundArt
 @onready var entities: Node2D = $Entities
 
 
@@ -104,25 +104,27 @@ func tile_center(c: int, r: int) -> Vector2:
 	return Vector2(c * TILE + TILE / 2.0, r * TILE + TILE / 2.0)
 
 
+## Collision-only tileset; the visible terrain is painted by GroundArt.
 func _make_tileset() -> TileSet:
 	var ts := TileSet.new()
 	ts.tile_size = Vector2i(TILE, TILE)
 	ts.add_physics_layer()
 	ts.set_physics_layer_collision_layer(0, 1)
 	ts.set_physics_layer_collision_mask(0, 0)
+	var img := Image.create(TILE * 2, TILE, false, Image.FORMAT_RGBA8)
+	img.fill(Color.WHITE)
 	var src := TileSetAtlasSource.new()
-	src.texture = TilesTexture
+	src.texture = ImageTexture.create_from_image(img)
 	src.texture_region_size = Vector2i(TILE, TILE)
 	ts.add_source(src, 0)
 	var full := PackedVector2Array([Vector2(-8, -8), Vector2(8, -8), Vector2(8, 8), Vector2(-8, 8)])
 	var top := PackedVector2Array([Vector2(-8, -8), Vector2(8, -8), Vector2(8, -3), Vector2(-8, -3)])
-	for i in T.size():
+	for i in [Collision.SOLID, Collision.LEDGE]:
 		src.create_tile(Vector2i(i, 0))
-		if i <= T.LEDGE:
-			var td := src.get_tile_data(Vector2i(i, 0), 0)
-			td.add_collision_polygon(0)
-			td.set_collision_polygon_points(0, 0, top if i == T.LEDGE else full)
-			td.set_collision_polygon_one_way(0, 0, i == T.LEDGE)
+		var td := src.get_tile_data(Vector2i(i, 0), 0)
+		td.add_collision_polygon(0)
+		td.set_collision_polygon_points(0, 0, top if i == Collision.LEDGE else full)
+		td.set_collision_polygon_one_way(0, 0, i == Collision.LEDGE)
 	return ts
 
 
@@ -130,19 +132,13 @@ func _build_tiles() -> void:
 	for r in height:
 		for c in width:
 			var ch := cell(c, r)
-			var t := -1
-			match ch:
-				"#":
-					if not is_solid(c, r - 1) and not (cell(c, r - 1) in ["T", "~"]):
-						t = T.GRASS
-					else:
-						t = T.DIRT_ROCKS if (c * 7 + r * 13) % 11 == 0 else T.DIRT
-				"=":
-					t = T.BRICK if is_solid(c, r - 1) else T.BRICK_MOSS
-				"-":
-					t = T.LEDGE
-			if t >= 0:
-				ground.set_cell(Vector2i(c, r), 0, Vector2i(t, 0))
+			if ch == "#" or ch == "=":
+				ground.set_cell(Vector2i(c, r), 0, Vector2i(Collision.SOLID, 0))
+			elif ch == "-":
+				ground.set_cell(Vector2i(c, r), 0, Vector2i(Collision.LEDGE, 0))
+	ground.visible = false
+	ground_art.level = self
+	ground_art.queue_redraw()
 
 
 ## Groups horizontal runs of tar/water into single hazard areas.
@@ -235,3 +231,10 @@ func _spawn_entities() -> void:
 	cam.limit_right = width * TILE
 	cam.limit_bottom = height * TILE
 	cam.reset_smoothing()
+	cam.add_child(_make_ambience())
+
+
+func _make_ambience() -> Node2D:
+	var fx := Node2D.new()
+	fx.set_script(AmbienceScript)
+	return fx
