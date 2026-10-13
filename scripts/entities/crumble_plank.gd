@@ -21,6 +21,7 @@ func _on_step(body: Node) -> void:
 	if _state != "solid" or not body.is_in_group("player"):
 		return
 	_state = "shaking"
+	Audio.play_at("plank", global_position, -2.0, 0.15)
 	var tw := create_tween()
 	for i in 4:
 		tw.tween_property(sprite, "position:x", 1.0, delay / 8.0)

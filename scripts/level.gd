@@ -61,6 +61,7 @@ func _ready() -> void:
 	_spawn_entities()
 	add_child(HudScene.instantiate())
 	GameState.show_message(level_title, 3.0)
+	Audio.play_music()
 	queue_redraw()
 
 

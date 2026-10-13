@@ -21,6 +21,7 @@ func _on_body_entered(body: Node) -> void:
 	if active or not body.is_in_group("player"):
 		return
 	_activate()
+	Audio.play("checkpoint", -2.0, 0.0)
 	GameState.set_checkpoint(_spawn_point())
 	GameState.add_score(50)
 	GameState.show_message("CHECKPOINT", 1.5)

@@ -31,6 +31,7 @@ func hit(amount: int) -> void:
 	if dying:
 		return
 	health -= amount
+	Audio.play_at("hit", global_position)
 	var tw := create_tween()
 	tw.tween_property(sprite, "modulate", Color(3, 3, 3), 0.05)
 	tw.tween_property(sprite, "modulate", Color.WHITE, 0.1)
@@ -41,6 +42,7 @@ func hit(amount: int) -> void:
 func _die() -> void:
 	dying = true
 	GameState.add_score(points)
+	Audio.play_at("enemy_die", global_position)
 	set_deferred("monitoring", false)
 	set_deferred("monitorable", false)
 	sprite.pause()

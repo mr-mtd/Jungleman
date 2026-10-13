@@ -31,6 +31,8 @@ func _physics_process(delta: float) -> void:
 		is_open = not is_open
 		_timer = open_time if is_open else closed_time
 		sprite.play("open" if is_open else "closed")
+		if not is_open:
+			Audio.play_at("snap", global_position, -6.0)
 	# small bob so it feels alive
 	sprite.position.y = -6.0 + (1.0 if fmod(Time.get_ticks_msec() / 600.0 + position.x, 2.0) > 1.0 else 0.0)
 	if is_open:

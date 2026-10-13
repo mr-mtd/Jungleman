@@ -39,14 +39,28 @@ Hold Jump for a higher jump; tap it for a short hop.
 
 You have 3 lives and a health meter. Running out of lives shows Game Over; press Jump to restart.
 
+## Music and sound
+
+The background track is an original looping jungle theme (hand drums, marimba, pan flute,
+warm pads, and a bed of insects and bird calls). Sound effects cover jumping, landing, getting
+hurt, dying, the whip and sling, enemy hits, every pickup, checkpoints, vines, the zipline, tar,
+water, crumbling planks, snakes, crocodile jaws, pausing, and the level complete and game over
+jingles.
+
+Everything is synthesized by `tools/generate_audio.py` (Python 3 with NumPy, plus `ffmpeg` to
+encode the music). Edit the script and run `python3 tools/generate_audio.py` to regenerate
+`assets/audio/`. In game, the `Audio` autoload (`scripts/autoload/audio.gd`) plays sounds with
+`Audio.play("jump")` or `Audio.play_at("snap", position)`, and routes them through `Music` and
+`SFX` buses so the two can be balanced separately.
+
 ## Project layout
 
 ```
-assets/          generated sprite sheets, SpriteFrames (.tres), tiles and parallax backgrounds
+assets/          generated sprite sheets, SpriteFrames (.tres), tiles, parallax backgrounds and audio
 levels/          level maps (ASCII, one character per 16x16 tile)
 scenes/          player, entities, HUD and level scenes
 scripts/         GDScript: player.gd, level.gd, entities/, ui/, autoload/game_state.gd
-tools/           generate_art.py (regenerates all art; needs Python 3 + Pillow)
+tools/           generate_art.py (all art) and generate_audio.py (music and sound effects)
 ```
 
 ### Editing the level
