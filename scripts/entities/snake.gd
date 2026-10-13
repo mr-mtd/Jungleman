@@ -24,6 +24,7 @@ func _physics_process(delta: float) -> void:
 			_strike = 0.6
 			_cooldown = 1.4
 			sprite.play("strike")
+			Audio.play_at("snake", global_position)
 			strike_shape.set_deferred("disabled", false)
 	if _strike > 0.0:
 		_strike -= delta

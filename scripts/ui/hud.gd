@@ -60,6 +60,7 @@ func _process(delta: float) -> void:
 	elif not _waiting_restart and Input.is_action_just_pressed("pause"):
 		get_tree().paused = not get_tree().paused
 		pause_label.visible = get_tree().paused
+		Audio.play("pause", 0.0, 0.0)
 
 
 func show_game_over() -> void:

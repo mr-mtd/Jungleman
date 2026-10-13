@@ -62,6 +62,8 @@ var zip_speed := 0.0
 
 var tar: TarPit = null
 var tar_jump_cooldown := 0.0
+var _was_on_floor := true
+var _fall_speed := 0.0
 
 @onready var sprite: AnimatedSprite2D = $Sprite
 @onready var shape: CollisionShape2D = $Shape
@@ -94,6 +96,8 @@ func _physics_process(delta: float) -> void:
 			velocity.x = 0
 			velocity.y = min(velocity.y + GRAVITY * delta, MAX_FALL)
 			move_and_slide()
+	if state != State.NORMAL:
+		_was_on_floor = false
 	_update_attacks(delta)
 	_update_animation()
 	sprite.visible = invuln <= 0.0 or state == State.DEAD or int(invuln * 20) % 2 == 0
@@ -136,6 +140,7 @@ func _normal(delta: float) -> void:
 			velocity.y = TAR_JUMP
 			jump_buffer = 0.0
 			tar_jump_cooldown = 0.3
+			Audio.play("tar", -4.0, 0.15)
 		if global_position.y - STAND_HEIGHT / 2.0 > tar.surface_y() - 4.0:
 			die(false)
 			return
@@ -145,10 +150,15 @@ func _normal(delta: float) -> void:
 			velocity.y = JUMP_VELOCITY
 			jump_buffer = 0.0
 			coyote = 0.0
+			Audio.play("jump")
 		if Input.is_action_just_released("jump") and velocity.y < 0.0:
 			velocity.y *= JUMP_CUT
 
+	_fall_speed = velocity.y
 	move_and_slide()
+	if is_on_floor() and not _was_on_floor and _fall_speed > 160.0 and not sinking:
+		Audio.play("land", linear_to_db(clampf(_fall_speed / MAX_FALL, 0.3, 1.0)))
+	_was_on_floor = is_on_floor()
 
 	if not is_on_floor() and hurt_time <= 0.0:
 		_try_grab()
@@ -169,6 +179,8 @@ func _set_crouch(value: bool) -> void:
 
 
 func enter_tar(pit: TarPit) -> void:
+	if tar == null and state != State.DEAD:
+		Audio.play("tar")
 	tar = pit
 
 
@@ -200,6 +212,7 @@ func _try_grab() -> void:
 			zip_t = t
 			zip_speed = max(velocity.dot(z.direction()), 40.0)
 			_set_crouch(false)
+			Audio.play("zipline")
 			return
 
 
@@ -211,6 +224,7 @@ func _attach_vine(v: Vine, dist: float) -> void:
 	velocity = Vector2.ZERO
 	_set_crouch(false)
 	attack_time = 0.0
+	Audio.play("vine")
 
 
 func _swing(delta: float) -> void:
@@ -226,6 +240,7 @@ func _swing(delta: float) -> void:
 	sprite.rotation = vine.angle
 	if Input.is_action_just_pressed("jump"):
 		_release_vine(vine.velocity_at(vine_grab) * 1.1 + VINE_RELEASE_BOOST)
+		Audio.play("jump", -2.0)
 
 
 func _release_vine(vel: Vector2) -> void:
@@ -248,6 +263,7 @@ func _zip(delta: float) -> void:
 		var vel := zipline.direction() * zip_speed
 		if zip_t < 1.0:
 			vel += Vector2(0, -120)
+			Audio.play("jump", -2.0)
 		zip_t = min(zip_t, 1.0)
 		global_position = zipline.point_at(zip_t) + Vector2(0, HAND_OFFSET)
 		velocity = vel
@@ -266,8 +282,10 @@ func _update_attacks(delta: float) -> void:
 		if Input.is_action_just_pressed("attack"):
 			attack_time = WHIP_TIME
 			whip_hits.clear()
+			Audio.play("whip")
 		elif Input.is_action_just_pressed("throw") and GameState.use_stone():
 			throw_time = THROW_TIME
+			Audio.play("throw")
 			var stone := StoneScene.instantiate()
 			stone.global_position = global_position + Vector2(10 * facing, -8 + (6 if crouching else 0))
 			stone.velocity = Vector2(260 * facing, -70)
@@ -312,6 +330,7 @@ func hurt(amount: int, from: Vector2) -> void:
 	if GameState.health <= 0:
 		die()
 		return
+	Audio.play("hurt", 0.0, 0.08)
 	invuln = INVULN_TIME
 	hurt_time = 0.35
 	attack_time = 0.0
@@ -333,12 +352,15 @@ func die(hop := true) -> void:
 	sprite.rotation = 0.0
 	state = State.DEAD
 	GameState.set_health(0)
+	Audio.play("die", 0.0, 0.0)
 	velocity = Vector2(0, -160) if hop and global_position.y < kill_y else Vector2.ZERO
 	collision_layer = 0
 	collision_mask = 0
 	await get_tree().create_timer(1.6).timeout
 	GameState.lose_life()
 	if GameState.lives <= 0:
+		Audio.stop_music(0.5)
+		Audio.play("game_over", 0.0, 0.0)
 		GameState.show_message("GAME OVER\nPress Jump to try again", 999.0)
 		get_tree().call_group("hud", "show_game_over")
 	else:
@@ -363,6 +385,8 @@ func win() -> void:
 		return
 	state = State.WIN
 	GameState.add_score(1000)
+	Audio.stop_music(0.4)
+	Audio.play("level_complete", 0.0, 0.0)
 	get_tree().call_group("hud", "show_level_complete")
 
 

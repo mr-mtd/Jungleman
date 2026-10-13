@@ -29,14 +29,18 @@ func _on_body_entered(body: Node) -> void:
 	match kind:
 		Kind.GOLD:
 			GameState.add_treasure()
+			Audio.play("gold", -2.0, 0.03)
 		Kind.STONES:
 			GameState.add_stones(5)
 			GameState.show_message("+5 SLING STONES", 1.0)
+			Audio.play("stones")
 		Kind.HEALTH:
 			body.heal(50)
 			GameState.add_score(25)
+			Audio.play("health")
 		Kind.LIFE:
 			GameState.add_life()
+			Audio.play("life", 0.0, 0.0)
 	set_deferred("monitoring", false)
 	var tw := create_tween().set_parallel()
 	tw.tween_property(self, "position:y", position.y - 12.0, 0.25)

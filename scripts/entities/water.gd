@@ -18,7 +18,13 @@ func _ready() -> void:
 	col.shape = rect
 	col.position = Vector2(size.x / 2.0, KILL_DEPTH + rect.size.y / 2.0)
 	add_child(col)
-	body_entered.connect(func(b): if b.has_method("die"): b.die(false))
+	body_entered.connect(_on_body_entered)
+
+
+func _on_body_entered(body: Node) -> void:
+	if body.has_method("die"):
+		Audio.play("splash")
+		body.die(false)
 
 
 func _process(delta: float) -> void:
